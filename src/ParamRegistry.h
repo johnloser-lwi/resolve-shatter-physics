@@ -1,0 +1,57 @@
+// Every parameter the plugin defines, recorded as it is defined.
+//
+// Copied from text-animator's src/param_registry.h. Its rationale applies here
+// unchanged, and more forcefully: this plugin has roughly forty parameters
+// across five pages.
+//
+// The alternative -- what MultiTransform does -- is a struct mirroring each
+// parameter by hand, written out three times: once in the struct, once in the
+// serialiser, once in the parser. Adding a parameter then means three edits, and
+// missing one produces a preset that silently fails to save that setting. No
+// error, no symptom, until someone reloads and finds their work reverted.
+//
+// Registering name and kind at the point of definition means presets cover every
+// parameter automatically, including ones added later, and there is one list
+// that cannot fall out of step with itself.
+#pragma once
+
+#include <string>
+#include <vector>
+
+namespace shp {
+
+enum ParamKind {
+  kPKNone = 0,  // groups, pages, push buttons: nothing to store
+  kPKDouble,
+  kPKInt,
+  kPKBool,
+  kPKChoice,
+  kPKRGBA,
+  kPKString,
+  kPKDouble2D,
+};
+
+struct ParamEntry {
+  std::string name;
+  int kind = kPKNone;
+};
+
+// Function-local static rather than namespace scope: describeInContext runs
+// while the host is loading the plugin, which is when static initialisation
+// order is least predictable.
+inline std::vector<ParamEntry>& paramRegistry() {
+  static std::vector<ParamEntry> entries;
+  return entries;
+}
+
+inline void registerParam(const std::string& name, int kind) {
+  if (kind == kPKNone || name.empty()) return;
+  // describeInContext can run more than once, once per supported context, and
+  // the registry must not accumulate duplicates or a preset would write every
+  // value several times over.
+  for (const ParamEntry& e : paramRegistry())
+    if (e.name == name) return;
+  paramRegistry().push_back(ParamEntry{name, kind});
+}
+
+}  // namespace shp
