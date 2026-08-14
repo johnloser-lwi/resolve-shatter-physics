@@ -692,6 +692,40 @@ void testColliderShapes() {
     }
   }
   check(penetrations == 0, "nothing ever gets inside a circle");
+
+  // A tilted box is a ramp: pieces landing on it must slide DOWNHILL rather than
+  // sitting where they landed. This is what catches a rotation applied to the
+  // drawing but not to the collision hull -- the box would look tilted and
+  // behave flat.
+  // Placed low enough that its rotated corners clear the lowest disc -- a wide
+  // box swings a long way up when it turns, and starting already overlapping
+  // would measure the solver pushing pieces out rather than them sliding.
+  //
+  // 35 degrees, not 20: friction is 0.4 here, and a slope only sheds once its
+  // tangent exceeds that. At 20 degrees (tan 0.36) the pieces correctly stay
+  // put, which would look exactly like rotation having been ignored.
+  std::vector<shp::Collider> ramp(1);
+  ramp[0].shape = shp::ColliderShape::Rect;
+  ramp[0].x1 = 0.10f;
+  ramp[0].y1 = 1.60f;
+  ramp[0].x2 = 0.90f;
+  ramp[0].y2 = 1.75f;
+  ramp[0].angle = 35.0f;
+
+  shp::SimCache rampSim;
+  std::vector<shp::ShardPose> onRamp;
+  rampSim.getPoses(geom, fp, pp, rp, fs, ramp, 90.0f, onRamp);
+
+  double drift = 0.0;
+  for (const shp::ShardPose& p : onRamp) drift += double(p.x);
+  // A positive angle turns the box clockwise on screen, which drops its right
+  // end -- so downhill is to the RIGHT and everything on it slides that way.
+  check(drift > 20.0, "a tilted box acts as a ramp and sheds pieces downhill");
+
+  std::vector<shp::Collider> flat = ramp;
+  flat[0].angle = 0.0f;
+  check(shp::HashSimParams(fp, pp, ramp) != shp::HashSimParams(fp, pp, flat),
+        "changing an obstacle's angle rebuilds the simulation");
 }
 
 // Changing a render-only control must NOT invalidate the simulation, or every

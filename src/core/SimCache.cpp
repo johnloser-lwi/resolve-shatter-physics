@@ -53,6 +53,7 @@ uint64_t HashSimParams(const ForceParams& fp, const PhysicsParams& pp,
     mixF(h, c.y1);
     mixF(h, c.x2);
     mixF(h, c.y2);
+    mixF(h, c.angle);
   }
 
   mixForce(h, fp.f1);

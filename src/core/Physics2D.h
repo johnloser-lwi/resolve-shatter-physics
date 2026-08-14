@@ -56,8 +56,17 @@ struct Collider {
   float x1 = 0.0f, y1 = 0.0f;
   float x2 = 0.0f, y2 = 0.0f;
 
+  /// Box only, degrees, about the box's own centre. Positive turns it clockwise
+  /// on screen.
+  ///
+  /// A circle does not need one, and a line already has any orientation its two
+  /// ends can express -- so this is the one shape where the two control points
+  /// alone cannot say everything.
+  float angle = 0.0f;
+
   bool operator==(const Collider& o) const {
-    return shape == o.shape && x1 == o.x1 && y1 == o.y1 && x2 == o.x2 && y2 == o.y2;
+    return shape == o.shape && x1 == o.x1 && y1 == o.y1 && x2 == o.x2 && y2 == o.y2 &&
+           angle == o.angle;
   }
 };
 

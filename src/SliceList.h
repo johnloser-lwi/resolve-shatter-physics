@@ -99,14 +99,14 @@ inline std::string FormatSlices(const std::vector<Slice>& slices) {
   return FormatSegments(slices);
 }
 
-// Obstacles carry a shape, so their records are five numbers rather than four
-// and they need their own pair. A shared parser reading a variable field count
-// would be the kind of cleverness that turns a half-typed field into a silently
-// misread one.
+// Obstacles carry a shape and an angle, so their records are six numbers rather
+// than four and they need their own pair. A shared parser reading a variable
+// field count would be the kind of cleverness that turns a half-typed field into
+// a silently misread one.
 inline std::vector<Collider> ParseColliders(const std::string& in) {
   std::vector<Collider> out;
 
-  float v[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  float v[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
   int have = 0;
   std::size_t i = 0;
 
@@ -125,7 +125,7 @@ inline std::vector<Collider> ParseColliders(const std::string& in) {
     i = std::size_t(end - in.c_str());
 
     v[have++] = f;
-    if (have == 5) {
+    if (have == 6) {
       Collider c;
       const int shape = int(v[0]);
       // Clamped rather than rejected: a file from a future version with a shape
@@ -135,6 +135,7 @@ inline std::vector<Collider> ParseColliders(const std::string& in) {
       c.y1 = v[2];
       c.x2 = v[3];
       c.y2 = v[4];
+      c.angle = v[5];
       out.push_back(c);
       have = 0;
     }
@@ -144,11 +145,11 @@ inline std::vector<Collider> ParseColliders(const std::string& in) {
 
 inline std::string FormatColliders(const std::vector<Collider>& colliders) {
   std::string out;
-  char buf[112];
+  char buf[128];
   for (std::size_t i = 0; i < colliders.size(); ++i) {
     const Collider& c = colliders[i];
-    std::snprintf(buf, sizeof(buf), "%s%d,%.4f,%.4f,%.4f,%.4f", i ? "; " : "", int(c.shape),
-                  c.x1, c.y1, c.x2, c.y2);
+    std::snprintf(buf, sizeof(buf), "%s%d,%.4f,%.4f,%.4f,%.4f,%.2f", i ? "; " : "",
+                  int(c.shape), c.x1, c.y1, c.x2, c.y2, c.angle);
     out += buf;
   }
   return out;

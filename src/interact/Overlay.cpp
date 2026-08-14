@@ -132,11 +132,12 @@ struct ForceView {
   double delay = 0.0;
 };
 
-enum class Grab { None, Centre, Radius, Width, Direction, SegEnd, SegNew };
+enum class Grab { None, Centre, Radius, Width, Direction, SegEnd, SegNew, SegRotate };
 
 constexpr Colour kCut = {1.00f, 0.28f, 0.34f, 0.95f};
 constexpr Colour kObstacle = {0.25f, 0.95f, 0.72f, 0.95f};
 constexpr Colour kPending = {1.00f, 0.85f, 0.30f, 0.95f};
+constexpr Colour kDelete = {1.00f, 0.42f, 0.42f, 1.00f};
 
 /// The two drawing tools share their gesture, their storage format and their
 /// handles; only the parameter they write and the colour they draw in differ.
@@ -222,12 +223,35 @@ class ForceInteract : public OFX::OverlayInteract {
       const bool colliders = pass == 0;
       if (!toolOn(args.time, colliders)) continue;
 
-      const std::vector<Entry> segs = readList(args.time, colliders);
+      std::vector<Entry> segs = readList(args.time, colliders);
+
+      // Delete first. It is the smallest target and sits just outside the
+      // shape, so anything else winning the hit test would make it unclickable
+      // on a small obstacle.
       for (std::size_t i = 0; i < segs.size(); ++i) {
+        const Handles h = handlesFor(c, segs[i]);
+        if (!nearPoint(c, args.penPosition, h.remove.x, h.remove.y, 8.0)) continue;
+
+        EditBlock block(_effect, colliders ? "Delete Obstacle" : "Delete Cut");
+        segs.erase(segs.begin() + std::ptrdiff_t(i));
+        writeList(segs, colliders);
+        return true;   // a click, not a drag: nothing to keep hold of
+      }
+
+      for (std::size_t i = 0; i < segs.size(); ++i) {
+        const Handles h = handlesFor(c, segs[i]);
+
+        if (h.hasRotate && nearPoint(c, args.penPosition, h.rotate.x, h.rotate.y)) {
+          _segIndex = int(i);
+          _onColliders = colliders;
+          _grab = Grab::SegRotate;
+          BeginEdit(_effect, "Rotate Obstacle");
+          return true;
+        }
+
+        const OfxPointD ends[2] = {h.p1, h.p2};
         for (int e = 0; e < 2; ++e) {
-          const OfxPointD p = c.toCanonical(e == 0 ? segs[i].x1 : segs[i].x2,
-                                            e == 0 ? segs[i].y1 : segs[i].y2);
-          if (nearPoint(c, args.penPosition, p.x, p.y)) {
+          if (nearPoint(c, args.penPosition, ends[e].x, ends[e].y)) {
             _segIndex = int(i);
             _segEnd = e;
             _onColliders = colliders;
@@ -310,18 +334,57 @@ class ForceInteract : public OFX::OverlayInteract {
       _pending.y2 = float(ny);
       return true;
     }
+    if (_grab == Grab::SegRotate) {
+      try {
+        std::vector<Entry> segs = readList(args.time, _onColliders);
+        if (_segIndex >= 0 && _segIndex < int(segs.size())) {
+          Entry& e = segs[std::size_t(_segIndex)];
+          const OfxPointD mid = c.toCanonical(0.5 * (double(e.x1) + double(e.x2)),
+                                              0.5 * (double(e.y1) + double(e.y2)));
+          // Angle from the box's centre to the pointer, measured so that zero
+          // points along the box's own "up". Negated on the way out for the
+          // same y-axis reason boxCorners documents.
+          const double dx = args.penPosition.x - mid.x;
+          const double dy = args.penPosition.y - mid.y;
+          double deg = -std::atan2(dx, dy) * 180.0 / 3.14159265358979323846;
+          if (deg < 0.0) deg += 360.0;
+          e.angle = float(deg);
+          writeList(segs, _onColliders);
+        }
+      } catch (...) {
+      }
+      return true;
+    }
     if (_grab == Grab::SegEnd) {
       try {
         std::vector<Entry> segs = readList(args.time, _onColliders);
         if (_segIndex >= 0 && _segIndex < int(segs.size())) {
+          Entry& e = segs[std::size_t(_segIndex)];
           double nx = 0.0, ny = 0.0;
           c.toNormalized(args.penPosition, nx, ny);
+
+          // A rotated box stores its corners UNROTATED, so the pointer has to be
+          // turned back into that frame before it can be written down. Without
+          // this, dragging a corner of a turned box moves it along the screen
+          // axes and the box appears to shear.
+          if (e.shape == ColliderShape::Rect && e.angle != 0.0f) {
+            const double cxN = 0.5 * (double(e.x1) + double(e.x2));
+            const double cyN = 0.5 * (double(e.y1) + double(e.y2));
+            const OfxPointD mid = c.toCanonical(cxN, cyN);
+            const double a = double(e.angle) * 3.14159265358979323846 / 180.0;
+            const double ca = std::cos(a), sa = std::sin(a);
+            const double rx = args.penPosition.x - mid.x;
+            const double ry = args.penPosition.y - mid.y;
+            const OfxPointD un{mid.x + rx * ca - ry * sa, mid.y + rx * sa + ry * ca};
+            c.toNormalized(un, nx, ny);
+          }
+
           if (_segEnd == 0) {
-            segs[std::size_t(_segIndex)].x1 = float(nx);
-            segs[std::size_t(_segIndex)].y1 = float(ny);
+            e.x1 = float(nx);
+            e.y1 = float(ny);
           } else {
-            segs[std::size_t(_segIndex)].x2 = float(nx);
-            segs[std::size_t(_segIndex)].y2 = float(ny);
+            e.x2 = float(nx);
+            e.y2 = float(ny);
           }
           writeList(segs, _onColliders);
         }
@@ -462,7 +525,98 @@ class ForceInteract : public OFX::OverlayInteract {
   struct Entry {
     ColliderShape shape = ColliderShape::Line;
     float x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+    float angle = 0;   // Box only
   };
+
+  /// Every handle an entry offers, computed once and used by BOTH the drawing
+  /// and the hit test. Two functions deriving these independently is how a
+  /// handle ends up drawn somewhere it cannot be grabbed.
+  struct Handles {
+    OfxPointD p1{0, 0};
+    OfxPointD p2{0, 0};
+    OfxPointD rotate{0, 0};
+    OfxPointD remove{0, 0};
+    bool hasRotate = false;
+    OfxPointD corner[4];   // Box only: the rotated outline
+  };
+
+  /// The box's four corners in canonical space.
+  ///
+  /// The angle is stored in the core's top-down frame where positive turns
+  /// clockwise on screen. Canonical coordinates run y-UP, so reproducing the
+  /// same turn here means rotating by the NEGATED angle. This is the only place
+  /// that conversion happens.
+  static void boxCorners(const Ctx& c, const Entry& e, OfxPointD* out) {
+    const double cxN = 0.5 * (double(e.x1) + double(e.x2));
+    const double cyN = 0.5 * (double(e.y1) + double(e.y2));
+    const OfxPointD mid = c.toCanonical(cxN, cyN);
+    const double hx = std::fabs(double(e.x2) - double(e.x1)) * 0.5 * c.width();
+    const double hy = std::fabs(double(e.y2) - double(e.y1)) * 0.5 * c.height();
+
+    const double a = -double(e.angle) * 3.14159265358979323846 / 180.0;
+    const double ca = std::cos(a), sa = std::sin(a);
+    const double lx[4] = {-hx, hx, hx, -hx};
+    const double ly[4] = {-hy, -hy, hy, hy};
+    for (int i = 0; i < 4; ++i) {
+      out[i].x = mid.x + lx[i] * ca - ly[i] * sa;
+      out[i].y = mid.y + lx[i] * sa + ly[i] * ca;
+    }
+  }
+
+  Handles handlesFor(const Ctx& c, const Entry& e) const {
+    Handles h;
+    h.p1 = c.toCanonical(e.x1, e.y1);
+    h.p2 = c.toCanonical(e.x2, e.y2);
+
+    // Bounds of what is actually drawn, so the delete handle sits clear of the
+    // shape whatever the shape is.
+    double minX, minY, maxX, maxY;
+
+    if (e.shape == ColliderShape::Rect) {
+      boxCorners(c, e, h.corner);
+      minX = maxX = h.corner[0].x;
+      minY = maxY = h.corner[0].y;
+      for (int i = 1; i < 4; ++i) {
+        minX = std::min(minX, h.corner[i].x);
+        maxX = std::max(maxX, h.corner[i].x);
+        minY = std::min(minY, h.corner[i].y);
+        maxY = std::max(maxY, h.corner[i].y);
+      }
+      // The rotate handle rides on the box's own "up", pushed clear of the edge
+      // so it never lands under a corner handle.
+      const double mx = 0.5 * (h.corner[0].x + h.corner[2].x);
+      const double my = 0.5 * (h.corner[0].y + h.corner[2].y);
+      const double ux = h.corner[0].x - h.corner[3].x;
+      const double uy = h.corner[0].y - h.corner[3].y;
+      const double ulen = std::sqrt(ux * ux + uy * uy);
+      const double nx = ulen > 1e-6 ? ux / ulen : 0.0;
+      const double ny = ulen > 1e-6 ? uy / ulen : 1.0;
+      const double edge = 0.5 * ulen;
+      h.rotate.x = mx + nx * (edge + c.sx(26.0));
+      h.rotate.y = my + ny * (edge + c.sy(26.0));
+      h.hasRotate = true;
+    } else if (e.shape == ColliderShape::Circle) {
+      const double r = std::sqrt((h.p2.x - h.p1.x) * (h.p2.x - h.p1.x) +
+                                 (h.p2.y - h.p1.y) * (h.p2.y - h.p1.y));
+      minX = h.p1.x - r;
+      maxX = h.p1.x + r;
+      minY = h.p1.y - r;
+      maxY = h.p1.y + r;
+    } else {
+      minX = std::min(h.p1.x, h.p2.x);
+      maxX = std::max(h.p1.x, h.p2.x);
+      minY = std::min(h.p1.y, h.p2.y);
+      maxY = std::max(h.p1.y, h.p2.y);
+    }
+
+    // Top-right of the shape's bounds, offset outward. Fixed in screen pixels,
+    // so it stays reachable at any zoom and never collides with a control point.
+    h.remove.x = maxX + c.sx(13.0);
+    h.remove.y = maxY + c.sy(13.0);
+    (void)minX;
+    (void)minY;
+    return h;
+  }
 
   std::vector<Entry> readList(double t, bool colliders) const {
     std::string s;
@@ -474,10 +628,10 @@ class ForceInteract : public OFX::OverlayInteract {
     std::vector<Entry> out;
     if (colliders) {
       for (const Collider& c : ParseColliders(s))
-        out.push_back(Entry{c.shape, c.x1, c.y1, c.x2, c.y2});
+        out.push_back(Entry{c.shape, c.x1, c.y1, c.x2, c.y2, c.angle});
     } else {
       for (const Slice& c : ParseSegments<Slice>(s, kMaxSlices))
-        out.push_back(Entry{ColliderShape::Line, c.x1, c.y1, c.x2, c.y2});
+        out.push_back(Entry{ColliderShape::Line, c.x1, c.y1, c.x2, c.y2, 0.0f});
     }
     return out;
   }
@@ -493,6 +647,7 @@ class ForceInteract : public OFX::OverlayInteract {
         c.y1 = e.y1;
         c.x2 = e.x2;
         c.y2 = e.y2;
+        c.angle = e.angle;
         cs.push_back(c);
       }
       text = FormatColliders(cs);
@@ -522,8 +677,7 @@ class ForceInteract : public OFX::OverlayInteract {
 
   // One entry drawn, whatever it is.
   void drawEntry(const Ctx& c, const Entry& e, const Colour& col, bool handles) {
-    const OfxPointD a = c.toCanonical(e.x1, e.y1);
-    const OfxPointD b = c.toCanonical(e.x2, e.y2);
+    const Handles h = handlesFor(c, e);
 
     // Dark pass then light, so a line stays readable over both bright and dark
     // footage -- an obstacle you cannot see is one you cannot move.
@@ -532,26 +686,51 @@ class ForceInteract : public OFX::OverlayInteract {
       c.draw->setLineWidth(c.ctx, pass == 0 ? 3.0f : 1.0f);
 
       switch (e.shape) {
-        case ColliderShape::Rect: {
-          const OfxPointD p[4] = {{a.x, a.y}, {b.x, a.y}, {b.x, b.y}, {a.x, b.y}};
-          c.draw->draw(c.ctx, kOfxDrawPrimitiveLineLoop, p, 4);
+        case ColliderShape::Rect:
+          c.draw->draw(c.ctx, kOfxDrawPrimitiveLineLoop, h.corner, 4);
           break;
-        }
         case ColliderShape::Circle: {
-          const double r = std::sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y));
-          ellipse(c, a.x, a.y, r, r);
+          const double r = std::sqrt((h.p2.x - h.p1.x) * (h.p2.x - h.p1.x) +
+                                     (h.p2.y - h.p1.y) * (h.p2.y - h.p1.y));
+          ellipse(c, h.p1.x, h.p1.y, r, r);
           break;
         }
         case ColliderShape::Line:
         default:
-          line(c, a.x, a.y, b.x, b.y);
+          line(c, h.p1.x, h.p1.y, h.p2.x, h.p2.y);
           break;
       }
     }
 
     if (!handles) return;
-    handle(c, a.x, a.y, col, 4.0);
-    handle(c, b.x, b.y, col, 4.0);
+    handle(c, h.p1.x, h.p1.y, col, 4.0);
+    handle(c, h.p2.x, h.p2.y, col, 4.0);
+
+    if (h.hasRotate) {
+      // Tethered to the box, so it reads as belonging to it rather than as a
+      // stray point floating nearby.
+      setColour(c, kShadow);
+      c.draw->setLineWidth(c.ctx, 3.0f);
+      const double mx = 0.5 * (h.corner[0].x + h.corner[2].x);
+      const double my = 0.5 * (h.corner[0].y + h.corner[2].y);
+      line(c, mx, my, h.rotate.x, h.rotate.y);
+      setColour(c, col);
+      c.draw->setLineWidth(c.ctx, 1.0f);
+      line(c, mx, my, h.rotate.x, h.rotate.y);
+      handle(c, h.rotate.x, h.rotate.y, col, 4.0);
+    }
+
+    // Delete: a cross rather than a filled square, so it never reads as one more
+    // thing to drag.
+    const double r = c.sx(5.0), ry = c.sy(5.0);
+    setColour(c, kShadow);
+    c.draw->setLineWidth(c.ctx, 4.0f);
+    line(c, h.remove.x - r, h.remove.y - ry, h.remove.x + r, h.remove.y + ry);
+    line(c, h.remove.x - r, h.remove.y + ry, h.remove.x + r, h.remove.y - ry);
+    setColour(c, kDelete);
+    c.draw->setLineWidth(c.ctx, 2.0f);
+    line(c, h.remove.x - r, h.remove.y - ry, h.remove.x + r, h.remove.y + ry);
+    line(c, h.remove.x - r, h.remove.y + ry, h.remove.x + r, h.remove.y - ry);
   }
 
   void drawList(const Ctx& c, double t, bool colliders) {

@@ -126,6 +126,7 @@ void World::reset(const std::vector<Shard>& shards, const ForceParams& fp,
   for (const Collider& c : colliders) {
     Collider p;
     p.shape = c.shape;
+    p.angle = c.angle;   // an angle is not a coordinate; it does not get scaled
     p.x1 = c.x1 * fs.width;
     p.y1 = c.y1 * fs.height;
     p.x2 = c.x2 * fs.width;
@@ -436,7 +437,8 @@ void World::collectColliderContacts() {
         const float lo_y = std::min(a.y, e.y), hi_y = std::max(a.y, e.y);
         if (hi_x - lo_x < 1.0f || hi_y - lo_y < 1.0f) continue;
 
-        // Cheap reject on the bounding circle before the SAT.
+        // Cheap reject on the bounding circle before the SAT. The half-diagonal
+        // is rotation-invariant, so this holds at any angle.
         const Vec2 mid((lo_x + hi_x) * 0.5f, (lo_y + hi_y) * 0.5f);
         const float half = Length(Vec2(hi_x - mid.x, hi_y - mid.y));
         if (LengthSq(centre - mid) > (b.radius + half) * (b.radius + half)) continue;
@@ -447,11 +449,19 @@ void World::collectColliderContacts() {
         // through it. Worth checking against PolygonArea rather than by eye --
         // top-down y makes "counter-clockwise" read backwards on screen, and
         // this was written the wrong way round the first time.
+        //
+        // Rotation preserves winding, so the same order holds at any angle.
+        const float hx = (hi_x - lo_x) * 0.5f;
+        const float hy = (hi_y - lo_y) * 0.5f;
+        const float ca = cosf(c.angle * kPi / 180.0f);
+        const float sa = sinf(c.angle * kPi / 180.0f);
+
         box.clear();
-        box.push_back(Vec2(lo_x, lo_y));
-        box.push_back(Vec2(hi_x, lo_y));
-        box.push_back(Vec2(hi_x, hi_y));
-        box.push_back(Vec2(lo_x, hi_y));
+        const float lx[4] = {-hx, hx, hx, -hx};
+        const float ly[4] = {-hy, -hy, hy, hy};
+        for (int k = 0; k < 4; ++k)
+          box.push_back(Vec2(mid.x + lx[k] * ca - ly[k] * sa, mid.y + lx[k] * sa + ly[k] * ca));
+
         addPolyContacts(int(i), -1, _worldVerts, box);
         continue;
       }

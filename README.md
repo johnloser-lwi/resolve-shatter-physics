@@ -190,8 +190,19 @@ across the viewer. Each drag adds one obstacle.
 | Line | the two ends |
 
 Existing obstacles keep whatever they were drawn as, so a scene can mix all
-three. Every shape is stored as just **two control points**, which is what lets
-one pair of drag handles edit all of them. **Clear Obstacles** removes the lot.
+three. Every shape is stored as **two control points** plus, for a box, an angle
+— which is what lets one pair of drag handles edit all of them.
+
+A box carries a **rotation handle** on a short tether beyond its upper edge:
+drag it to turn the box about its own centre. Tilt one past about 22 degrees and
+it stops being a shelf and becomes a ramp — pieces landing on it slide off the
+low end. (Below roughly the friction angle they will just sit there, which is
+correct rather than broken; raise the tilt or lower **Friction**.) A circle needs
+no rotation, and a line already has any orientation its two ends can express.
+
+Every cut and every obstacle also has a small **red ×** just outside its top-right
+corner while its tool is armed. Click it to delete that one. **Clear Cuts** and
+**Clear Obstacles** remove all of them at once, and undo brings any of it back.
 
 **Box and Circle are solid all the way through** — they are real convex bodies,
 not outlines. Four lines around a box would leave an interior that anything
@@ -209,9 +220,10 @@ and away. That is correct, not a bug, and it is why the test suite checks that
 nothing ever gets *inside* a circle rather than that anything comes to rest on
 one.
 
-Obstacles live in the **Obstacles** field as `shape,x1,y1,x2,y2` (0 = line,
+Obstacles live in the **Obstacles** field as `shape,x1,y1,x2,y2,angle` (0 = line,
 1 = box, 2 = circle), capped at 32 because every one is tested against every
-moving piece every substep. Changing any of it — including the shape alone —
+moving piece every substep. Type an exact angle there if dragging the handle is
+not precise enough. Changing any of it — the shape or the angle alone included —
 rebuilds the cached simulation.
 
 ### Render
@@ -461,7 +473,23 @@ round the first time.
 copy loop in `World::reset`.** Both were missed when the shape field went in.
 Forgetting the hash means changing a shape silently keeps the old simulation;
 forgetting the copy means every obstacle becomes whatever the struct's default
-is. Neither produces an error, and both look like a physics bug.
+is. Neither produces an error, and both look like a physics bug. Note that the
+copy loop scales coordinates to pixels but must NOT scale the angle.
+
+**A rotated box stores its corners unrotated.** The angle is applied when the
+hull is built, and the overlay un-rotates the pointer before writing a dragged
+corner back. Skip that and dragging a corner of a turned box moves it along the
+screen axes instead of the box's own, so the box appears to shear.
+
+**Overlay handle positions come from one function, `handlesFor`.** Drawing and
+hit-testing both call it. Deriving them separately is how a handle ends up drawn
+somewhere it cannot be grabbed — and the delete cross has to be hit-tested
+*first*, because it is the smallest target and sits close enough to the shape
+that any other handle would otherwise win on a small obstacle.
+
+**The angle convention is converted in exactly one place.** Positive turns a box
+clockwise on screen. Core space is top-down and canonical overlay space is
+y-up, so `boxCorners` negates it; nothing else may.
 
 **A drawn obstacle picks its normal from which side the piece is on, every
 substep.** That is what makes one line solid from both directions. The

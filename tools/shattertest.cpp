@@ -278,8 +278,10 @@ int main(int argc, char** argv) {
       co.shape = a == "--box"      ? shp::ColliderShape::Rect
                  : a == "--circle" ? shp::ColliderShape::Circle
                                    : shp::ColliderShape::Line;
-      if (std::sscanf(argv[++i], "%f,%f,%f,%f", &co.x1, &co.y1, &co.x2, &co.y2) == 4)
-        colliders.push_back(co);
+      // The angle is optional, so "--box x1,y1,x2,y2" still means an upright one.
+      const int got = std::sscanf(argv[++i], "%f,%f,%f,%f,%f", &co.x1, &co.y1, &co.x2, &co.y2,
+                                  &co.angle);
+      if (got >= 4) colliders.push_back(co);
     }
   }
 
