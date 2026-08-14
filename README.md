@@ -476,10 +476,24 @@ forgetting the copy means every obstacle becomes whatever the struct's default
 is. Neither produces an error, and both look like a physics bug. Note that the
 copy loop scales coordinates to pixels but must NOT scale the angle.
 
-**A rotated box stores its corners unrotated.** The angle is applied when the
-hull is built, and the overlay un-rotates the pointer before writing a dragged
-corner back. Skip that and dragging a corner of a turned box moves it along the
-screen axes instead of the box's own, so the box appears to shear.
+**A rotated box stores its corners unrotated**, and applies the angle only when
+drawing or when building the collision hull. Two consequences, both of which
+were got wrong first time and both of which now live in `core/BoxHandles.h`
+where the test suite can reach them:
+
+- The corner **handles** must be rotated too, or they sit off the outline they
+  belong to.
+- Resizing must pivot on the **opposite corner, captured at pen-down**. The
+  obvious version un-rotates the pointer about the box's centre — but the centre
+  is the midpoint of the two corners, one of which the drag is rewriting, so
+  every event is measured against a pivot the previous event already moved. It
+  compounds, and the handle becomes impossible to control. `testRotatedBoxHandles`
+  replays fifty events at one pointer position and demands nothing drift.
+
+That geometry is in `core` rather than in the overlay specifically because the
+overlay needs OFX headers and therefore cannot be tested. Anything in the
+interact layer that is arithmetic rather than plumbing belongs on the other side
+of that line.
 
 **Overlay handle positions come from one function, `handlesFor`.** Drawing and
 hit-testing both call it. Deriving them separately is how a handle ends up drawn

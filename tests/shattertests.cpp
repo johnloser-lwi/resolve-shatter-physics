@@ -6,6 +6,7 @@
 //
 // Run: ctest --test-dir build --output-on-failure
 #include "Ballistic.h"
+#include "BoxHandles.h"
 #include "Cells.h"
 #include "Compositor.h"
 #include "Physics2D.h"
@@ -728,6 +729,81 @@ void testColliderShapes() {
         "changing an obstacle's angle rebuilds the simulation");
 }
 
+// Dragging the corner handles of a ROTATED box.
+//
+// Both of these shipped broken once. The handles were drawn at the unrotated
+// corners so they sat off the outline entirely, and the resize un-rotated the
+// pointer about the box centre -- which the drag itself was moving, so every
+// event compounded the last and the handle could not be controlled.
+void testRotatedBoxHandles() {
+  // An off-square box at an awkward angle: a square or a right angle would let
+  // a transposed sign pass unnoticed.
+  const shp::Vec2 p1(100.0f, 60.0f);
+  const shp::Vec2 p2(300.0f, 160.0f);
+  const float rad = 37.0f * 3.14159265358979323846f / 180.0f;
+
+  const shp::Vec2 d1 = shp::DrawnCorner(p1, p1, p2, rad);
+  const shp::Vec2 d2 = shp::DrawnCorner(p2, p1, p2, rad);
+
+  // The drawn corners must actually be turned, or nothing below means anything.
+  check(std::fabs(d1.x - p1.x) > 1.0f || std::fabs(d1.y - p1.y) > 1.0f,
+        "a rotated box draws its handles somewhere other than the stored corners");
+
+  // Opposite corners keep the centre as their midpoint under rotation, which is
+  // the property the whole resize rests on.
+  const shp::Vec2 midStored = shp::MidPoint(p1, p2);
+  const shp::Vec2 midDrawn = shp::MidPoint(d1, d2);
+  check(std::fabs(midDrawn.x - midStored.x) < 1e-3f &&
+            std::fabs(midDrawn.y - midStored.y) < 1e-3f,
+        "rotation leaves opposite corners sharing the centre");
+
+  // Grab d1, drag it somewhere. d2 is the anchor and must not move.
+  const shp::Vec2 pointer(150.0f, 20.0f);
+  shp::Vec2 dragged, fixed;
+  shp::ResizeRotatedBox(d2, pointer, rad, dragged, fixed);
+
+  const shp::Vec2 nd1 = shp::DrawnCorner(dragged, dragged, fixed, rad);
+  const shp::Vec2 nd2 = shp::DrawnCorner(fixed, dragged, fixed, rad);
+
+  check(std::fabs(nd1.x - pointer.x) < 1e-2f && std::fabs(nd1.y - pointer.y) < 1e-2f,
+        "the dragged corner lands exactly under the pointer");
+  check(std::fabs(nd2.x - d2.x) < 1e-2f && std::fabs(nd2.y - d2.y) < 1e-2f,
+        "the opposite corner does not move while resizing");
+
+  // The angle is unchanged by a resize.
+  check(std::fabs(shp::Length(nd1 - nd2) - shp::Length(pointer - d2)) < 1e-2f,
+        "the box's diagonal matches pointer to anchor");
+
+  // Idempotence is the real test of the feedback bug. Re-applying the same
+  // pointer position must change nothing; the broken version drifted further
+  // every time, which is exactly what an uncontrollable handle feels like.
+  shp::Vec2 a2, b2;
+  shp::ResizeRotatedBox(d2, pointer, rad, a2, b2);
+  check(std::fabs(a2.x - dragged.x) < 1e-4f && std::fabs(a2.y - dragged.y) < 1e-4f &&
+            std::fabs(b2.x - fixed.x) < 1e-4f && std::fabs(b2.y - fixed.y) < 1e-4f,
+        "resizing is idempotent: the same pointer gives the same box");
+
+  // And a whole gesture: many events at the same place must not creep.
+  shp::Vec2 ax = dragged, bx = fixed;
+  for (int i = 0; i < 50; ++i) {
+    const shp::Vec2 anchorNow = shp::DrawnCorner(bx, ax, bx, rad);
+    shp::ResizeRotatedBox(anchorNow, pointer, rad, ax, bx);
+  }
+  const shp::Vec2 endDragged = shp::DrawnCorner(ax, ax, bx, rad);
+  const shp::Vec2 endFixed = shp::DrawnCorner(bx, ax, bx, rad);
+  check(std::fabs(endDragged.x - pointer.x) < 0.1f && std::fabs(endDragged.y - pointer.y) < 0.1f,
+        "fifty events at one position leave the dragged corner put");
+  check(std::fabs(endFixed.x - d2.x) < 0.1f && std::fabs(endFixed.y - d2.y) < 0.1f,
+        "fifty events at one position leave the anchor put");
+
+  // An unrotated box must behave exactly as it always did.
+  shp::Vec2 ua, ub;
+  shp::ResizeRotatedBox(p2, pointer, 0.0f, ua, ub);
+  check(std::fabs(ua.x - pointer.x) < 1e-4f && std::fabs(ua.y - pointer.y) < 1e-4f &&
+            std::fabs(ub.x - p2.x) < 1e-4f && std::fabs(ub.y - p2.y) < 1e-4f,
+        "an unrotated box resizes to the pointer directly");
+}
+
 // Changing a render-only control must NOT invalidate the simulation, or every
 // fade tweak would re-run the physics.
 void testFadeDoesNotInvalidateSim() {
@@ -989,6 +1065,7 @@ int main() {
   testSliceListRoundTrip();
   testColliders();
   testColliderShapes();
+  testRotatedBoxHandles();
   testFadeDoesNotInvalidateSim();
   testPiecesRestOnFloor();
   testRestFrameReproducesSource();

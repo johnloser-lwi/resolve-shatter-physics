@@ -11,6 +11,7 @@
 #include "../EditBlock.h"
 #include "../ParamNames.h"
 #include "../SliceList.h"
+#include "../core/BoxHandles.h"
 
 namespace shp {
 namespace {
@@ -256,6 +257,14 @@ class ForceInteract : public OFX::OverlayInteract {
             _segEnd = e;
             _onColliders = colliders;
             _grab = Grab::SegEnd;
+            // Snapshot the state the drag is relative to. Recomputing any of
+            // this per mouse-move is what made a rotated box uncontrollable:
+            // the un-rotate pivot is the box centre, the centre moves as the
+            // corner moves, so every event was measured against a pivot the
+            // previous event had already shifted.
+            _dragOrig = segs[i];
+            _dragAnchor = ends[1 - e];
+            c.toNormalized(args.penPosition, _dragStartNx, _dragStartNy);
             BeginEdit(_effect, colliders ? "Move Obstacle" : "Move Cut");
             return true;
           }
@@ -363,23 +372,43 @@ class ForceInteract : public OFX::OverlayInteract {
           double nx = 0.0, ny = 0.0;
           c.toNormalized(args.penPosition, nx, ny);
 
-          // A rotated box stores its corners UNROTATED, so the pointer has to be
-          // turned back into that frame before it can be written down. Without
-          // this, dragging a corner of a turned box moves it along the screen
-          // axes and the box appears to shear.
-          if (e.shape == ColliderShape::Rect && e.angle != 0.0f) {
-            const double cxN = 0.5 * (double(e.x1) + double(e.x2));
-            const double cyN = 0.5 * (double(e.y1) + double(e.y2));
-            const OfxPointD mid = c.toCanonical(cxN, cyN);
-            const double a = double(e.angle) * 3.14159265358979323846 / 180.0;
-            const double ca = std::cos(a), sa = std::sin(a);
-            const double rx = args.penPosition.x - mid.x;
-            const double ry = args.penPosition.y - mid.y;
-            const OfxPointD un{mid.x + rx * ca - ry * sa, mid.y + rx * sa + ry * ca};
-            c.toNormalized(un, nx, ny);
-          }
+          if (e.shape == ColliderShape::Rect) {
+            // Resize about the corner NOT being dragged, which was captured at
+            // pen-down and does not move for the rest of the gesture. That is
+            // both what a resize should do and what makes the maths stable.
+            //
+            // Opposite corners of a box share the centre as their midpoint, and
+            // rotation preserves that -- so the new centre follows directly
+            // from the fixed corner and the pointer, with no dependence on the
+            // values being rewritten.
+            Vec2 dragged, fixed;
+            ResizeRotatedBox(toVec(_dragAnchor), toVec(args.penPosition),
+                             float(angleRad(_dragOrig)), dragged, fixed);
 
-          if (_segEnd == 0) {
+            double ax = 0.0, ay = 0.0, bx = 0.0, by = 0.0;
+            c.toNormalized(toPt(dragged), ax, ay);
+            c.toNormalized(toPt(fixed), bx, by);
+
+            e.angle = _dragOrig.angle;
+            if (_segEnd == 0) {
+              e.x1 = float(ax); e.y1 = float(ay);
+              e.x2 = float(bx); e.y2 = float(by);
+            } else {
+              e.x2 = float(ax); e.y2 = float(ay);
+              e.x1 = float(bx); e.y1 = float(by);
+            }
+          } else if (e.shape == ColliderShape::Circle && _segEnd == 0) {
+            // The centre handle moves the whole circle. Changing the radius as
+            // a side effect of repositioning it would be a surprise, and the
+            // rim handle is right there for that. Measured from the pen-down
+            // state so a slow drag cannot accumulate drift.
+            const double dx = nx - _dragStartNx;
+            const double dy = ny - _dragStartNy;
+            e.x1 = float(double(_dragOrig.x1) + dx);
+            e.y1 = float(double(_dragOrig.y1) + dy);
+            e.x2 = float(double(_dragOrig.x2) + dx);
+            e.y2 = float(double(_dragOrig.y2) + dy);
+          } else if (_segEnd == 0) {
             e.x1 = float(nx);
             e.y1 = float(ny);
           } else {
@@ -563,10 +592,43 @@ class ForceInteract : public OFX::OverlayInteract {
     }
   }
 
+  static Vec2 toVec(const OfxPointD& p) { return Vec2(float(p.x), float(p.y)); }
+  static OfxPointD toPt(const Vec2& v) { return OfxPointD{double(v.x), double(v.y)}; }
+
+  /// Turn @p p about @p pivot. Radians, canonical space. Defers to core so the
+  /// overlay and the tests cannot disagree about what a rotation is.
+  static OfxPointD rotateAbout(const OfxPointD& p, const OfxPointD& pivot, double radians) {
+    return toPt(RotateAbout(toVec(p), toVec(pivot), float(radians)));
+  }
+
+  /// Canonical centre of an entry's two control points.
+  static OfxPointD midOf(const Ctx& c, const Entry& e) {
+    return c.toCanonical(0.5 * (double(e.x1) + double(e.x2)),
+                         0.5 * (double(e.y1) + double(e.y2)));
+  }
+
+  static double angleRad(const Entry& e) {
+    // Negated for the y-up canonical frame, the same single conversion
+    // boxCorners documents.
+    return -double(e.angle) * 3.14159265358979323846 / 180.0;
+  }
+
   Handles handlesFor(const Ctx& c, const Entry& e) const {
     Handles h;
     h.p1 = c.toCanonical(e.x1, e.y1);
     h.p2 = c.toCanonical(e.x2, e.y2);
+
+    // A box stores its corners UNROTATED, so the handles have to be turned to
+    // land on the outline that is actually drawn. Rotating the two stored
+    // corners about the centre is exact rather than approximate: opposite
+    // corners share the centre as their midpoint, so rotation maps them onto
+    // two opposite corners of the drawn box.
+    if (e.shape == ColliderShape::Rect && e.angle != 0.0f) {
+      const OfxPointD mid = midOf(c, e);
+      const double a = angleRad(e);
+      h.p1 = rotateAbout(h.p1, mid, a);
+      h.p2 = rotateAbout(h.p2, mid, a);
+    }
 
     // Bounds of what is actually drawn, so the delete handle sits clear of the
     // shape whatever the shape is.
@@ -908,6 +970,12 @@ class ForceInteract : public OFX::OverlayInteract {
   int _segIndex = -1;
   int _segEnd = 0;
   bool _onColliders = false;  ///< which list the current drag belongs to
+
+  // Captured at pen-down and left alone for the rest of the gesture. A drag
+  // measured against values it is itself rewriting feeds back on every event.
+  Entry _dragOrig;
+  OfxPointD _dragAnchor{0.0, 0.0};   ///< canonical, the handle NOT being dragged
+  double _dragStartNx = 0.0, _dragStartNy = 0.0;
 };
 
 // Wraps the Support library's interact entry so the draw context, which only
