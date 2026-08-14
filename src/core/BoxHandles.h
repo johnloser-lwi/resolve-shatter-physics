@@ -69,4 +69,34 @@ SHP_HD inline void ResizeRotatedBox(const Vec2& anchorDrawn, const Vec2& pointer
   outFixed = RotateAbout(anchorDrawn, mid, -radians);
 }
 
+// ------------------------------------------------------- the rotate handle
+//
+// These two are exact inverses, and that is the entire point of stating them as
+// a pair. Placing the handle in one direction while reading the angle back with
+// a formula that assumes another means the box jumps the instant the handle is
+// grabbed -- by 180 degrees if the placement is upside down, by twice the angle
+// if the sign is flipped. Both of those shipped.
+
+/** @brief Unit direction the rotate handle sits along, in the drawing frame.
+ *
+ * At zero this is the drawing frame's +y, which is the box's own "up". The
+ * expression is `rotate((0,1), radians)` written out. */
+SHP_HD inline Vec2 RotateHandleDir(float radians) {
+  return Vec2(-sinf(radians), cosf(radians));
+}
+
+/** @brief Recover the rotation from where the handle has been dragged to.
+ *
+ * @param offsetFromCentre pointer minus the box's centre, drawing frame.
+ * @return drawing-frame radians -- exactly what RotateHandleDir would take.
+ *
+ * A zero offset has no direction; it returns 0 rather than whatever atan2 makes
+ * of (0,0), so a click exactly on the centre leaves the box upright instead of
+ * snapping it somewhere arbitrary.
+ */
+SHP_HD inline float RotateHandleAngle(const Vec2& offsetFromCentre) {
+  if (LengthSq(offsetFromCentre) < 1e-12f) return 0.0f;
+  return atan2f(-offsetFromCentre.x, offsetFromCentre.y);
+}
+
 }  // namespace shp

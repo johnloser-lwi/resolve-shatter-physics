@@ -348,14 +348,15 @@ class ForceInteract : public OFX::OverlayInteract {
         std::vector<Entry> segs = readList(args.time, _onColliders);
         if (_segIndex >= 0 && _segIndex < int(segs.size())) {
           Entry& e = segs[std::size_t(_segIndex)];
-          const OfxPointD mid = c.toCanonical(0.5 * (double(e.x1) + double(e.x2)),
-                                              0.5 * (double(e.y1) + double(e.y2)));
-          // Angle from the box's centre to the pointer, measured so that zero
-          // points along the box's own "up". Negated on the way out for the
-          // same y-axis reason boxCorners documents.
-          const double dx = args.penPosition.x - mid.x;
-          const double dy = args.penPosition.y - mid.y;
-          double deg = -std::atan2(dx, dy) * 180.0 / 3.14159265358979323846;
+          // Rotation does not move the stored corners, so the centre is fixed
+          // for the whole gesture and there is no pivot to feed back on.
+          const OfxPointD mid = midOf(c, e);
+          const float r = RotateHandleAngle(
+              Vec2(float(args.penPosition.x - mid.x), float(args.penPosition.y - mid.y)));
+
+          // Back out of the drawing frame into the stored one, the same single
+          // negation angleRad applies going the other way.
+          double deg = -double(r) * 180.0 / 3.14159265358979323846;
           if (deg < 0.0) deg += 360.0;
           e.angle = float(deg);
           writeList(segs, _onColliders);
@@ -645,17 +646,20 @@ class ForceInteract : public OFX::OverlayInteract {
         maxY = std::max(maxY, h.corner[i].y);
       }
       // The rotate handle rides on the box's own "up", pushed clear of the edge
-      // so it never lands under a corner handle.
+      // so it never lands under a corner handle. The direction comes from
+      // RotateHandleDir precisely so that it matches what RotateHandleAngle
+      // reads back -- deriving it from the corners by hand is how it ended up
+      // pointing at the bottom of the box, which made it flip 180 degrees the
+      // moment it was grabbed.
       const double mx = 0.5 * (h.corner[0].x + h.corner[2].x);
       const double my = 0.5 * (h.corner[0].y + h.corner[2].y);
-      const double ux = h.corner[0].x - h.corner[3].x;
-      const double uy = h.corner[0].y - h.corner[3].y;
-      const double ulen = std::sqrt(ux * ux + uy * uy);
-      const double nx = ulen > 1e-6 ? ux / ulen : 0.0;
-      const double ny = ulen > 1e-6 ? uy / ulen : 1.0;
-      const double edge = 0.5 * ulen;
-      h.rotate.x = mx + nx * (edge + c.sx(26.0));
-      h.rotate.y = my + ny * (edge + c.sy(26.0));
+      const double ux = h.corner[3].x - h.corner[0].x;
+      const double uy = h.corner[3].y - h.corner[0].y;
+      const double edge = 0.5 * std::sqrt(ux * ux + uy * uy);
+
+      const Vec2 up = RotateHandleDir(float(angleRad(e)));
+      h.rotate.x = mx + double(up.x) * (edge + c.sx(26.0));
+      h.rotate.y = my + double(up.y) * (edge + c.sy(26.0));
       h.hasRotate = true;
     } else if (e.shape == ColliderShape::Circle) {
       const double r = std::sqrt((h.p2.x - h.p1.x) * (h.p2.x - h.p1.x) +

@@ -804,6 +804,54 @@ void testRotatedBoxHandles() {
         "an unrotated box resizes to the pointer directly");
 }
 
+// Placing the rotate handle and reading an angle back off it must be exact
+// inverses. When they were not, the box jumped the instant the handle was
+// touched -- 180 degrees from an upside-down placement, and twice the angle
+// from a flipped sign. Both shipped, and both are one round-trip apart.
+void testRotateHandle() {
+  const float kPi = 3.14159265358979323846f;
+
+  // The handle must sit on the box's own "up" at rest, not underneath it.
+  const shp::Vec2 rest = shp::RotateHandleDir(0.0f);
+  check(rest.y > 0.9f && std::fabs(rest.x) < 1e-4f,
+        "the rotate handle sits on the box's up at rest");
+
+  // Grabbing it and not moving must read back the angle it already had. This is
+  // the jump the user sees, stated directly.
+  bool roundTrips = true;
+  float worst = 0.0f;
+  for (int deg = -170; deg <= 180; deg += 10) {
+    const float r = float(deg) * kPi / 180.0f;
+    const shp::Vec2 dir = shp::RotateHandleDir(r);
+    // Handles sit some distance out, so the read-back must not care about
+    // length -- only direction.
+    const shp::Vec2 at(dir.x * 137.0f, dir.y * 137.0f);
+    const float back = shp::RotateHandleAngle(at);
+
+    float diff = back - r;
+    while (diff > kPi) diff -= 2.0f * kPi;      // 180 and -180 are the same place
+    while (diff < -kPi) diff += 2.0f * kPi;
+    if (std::fabs(diff) > worst) worst = std::fabs(diff);
+    if (std::fabs(diff) > 1e-3f) roundTrips = false;
+  }
+  char buf[128];
+  std::snprintf(buf, sizeof(buf),
+                "grabbing the rotate handle without moving changes nothing (worst %.2e rad)",
+                double(worst));
+  check(roundTrips, buf);
+
+  // Dragging the handle to the right of the centre must turn the box a quarter
+  // turn clockwise on screen, not anticlockwise. A sign flip round-trips
+  // perfectly and still turns the wrong way, so the direction needs saying too.
+  const float right = shp::RotateHandleAngle(shp::Vec2(50.0f, 0.0f));
+  const float storedDeg = -right * 180.0f / kPi;
+  check(std::fabs(storedDeg - 90.0f) < 1e-2f,
+        "dragging the handle right gives a quarter turn clockwise");
+
+  check(std::fabs(shp::RotateHandleAngle(shp::Vec2(0.0f, 0.0f))) < 1e-6f,
+        "a pointer exactly on the centre leaves the box upright");
+}
+
 // Changing a render-only control must NOT invalidate the simulation, or every
 // fade tweak would re-run the physics.
 void testFadeDoesNotInvalidateSim() {
@@ -1066,6 +1114,7 @@ int main() {
   testColliders();
   testColliderShapes();
   testRotatedBoxHandles();
+  testRotateHandle();
   testFadeDoesNotInvalidateSim();
   testPiecesRestOnFloor();
   testRestFrameReproducesSource();

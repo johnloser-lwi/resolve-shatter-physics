@@ -490,6 +490,17 @@ where the test suite can reach them:
   compounds, and the handle becomes impossible to control. `testRotatedBoxHandles`
   replays fifty events at one pointer position and demands nothing drift.
 
+**`RotateHandleDir` and `RotateHandleAngle` are exact inverses, and must stay
+that way.** Placing the handle in one direction while reading the angle back
+with a formula that assumes another makes the box jump the instant the handle is
+grabbed — by 180 degrees if the placement is upside down, by twice the angle if
+the sign is flipped. Both of those shipped, together, and the round-trip test
+that catches them is one loop over a range of angles.
+
+Note that a round trip alone is not sufficient: a sign flip round-trips
+perfectly and still turns the box the wrong way, so there is a separate check
+that dragging the handle to the right gives a quarter turn *clockwise*.
+
 That geometry is in `core` rather than in the overlay specifically because the
 overlay needs OFX headers and therefore cannot be tested. Anything in the
 interact layer that is arithmetic rather than plumbing belongs on the other side
