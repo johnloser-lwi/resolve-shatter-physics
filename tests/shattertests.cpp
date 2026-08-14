@@ -1,4 +1,4 @@
-// The properties that are expensive to discover are broken.
+﻿// The properties that are expensive to discover are broken.
 //
 // Every check here exists because getting it wrong produces something that still
 // renders a plausible-looking picture -- which is why they are assertions about
@@ -22,6 +22,10 @@
 namespace {
 
 int g_failures = 0;
+
+/// Most tests care about nothing the obstacles do, and naming the empty list
+/// says so at the call site rather than leaving a bare `{}` to be puzzled over.
+const std::vector<shp::Collider> noColliders;
 
 void check(bool ok, const char* what) {
   if (!ok) {
@@ -242,25 +246,25 @@ void testRigidDeterminism() {
   // Forward, straight to frame 40.
   shp::SimCache c1;
   std::vector<shp::ShardPose> straight;
-  c1.getPoses(geom, fp, pp, rp, fs, 40.0f, straight);
+  c1.getPoses(geom, fp, pp, rp, fs, noColliders, 40.0f, straight);
 
   // A separate cache walked one frame at a time to the same place.
   shp::SimCache c2;
   std::vector<shp::ShardPose> walked;
-  for (int f = 1; f <= 40; ++f) c2.getPoses(geom, fp, pp, rp, fs, float(f), walked);
+  for (int f = 1; f <= 40; ++f) c2.getPoses(geom, fp, pp, rp, fs, noColliders, float(f), walked);
   check(posesIdentical(straight, walked), "rigid: stepping there equals jumping there");
 
   // Scrub backward then forward again on the SAME cache: the backward lookup
   // must not disturb the stored timeline.
   std::vector<shp::ShardPose> back, again;
-  c1.getPoses(geom, fp, pp, rp, fs, 5.0f, back);
-  c1.getPoses(geom, fp, pp, rp, fs, 40.0f, again);
+  c1.getPoses(geom, fp, pp, rp, fs, noColliders, 5.0f, back);
+  c1.getPoses(geom, fp, pp, rp, fs, noColliders, 40.0f, again);
   check(posesIdentical(straight, again), "rigid: scrubbing backward does not corrupt the run");
 
   // A fresh cache with the same inputs reproduces the run exactly.
   shp::SimCache c3;
   std::vector<shp::ShardPose> fresh;
-  c3.getPoses(geom, fp, pp, rp, fs, 40.0f, fresh);
+  c3.getPoses(geom, fp, pp, rp, fs, noColliders, 40.0f, fresh);
   check(posesIdentical(straight, fresh), "rigid: a rebuilt cache reproduces the run");
 }
 
@@ -389,8 +393,8 @@ void testForceDelay() {
 
   shp::SimCache sim;
   std::vector<shp::ShardPose> rb, ra;
-  sim.getPoses(rgeom, rfp, pp, rp, rfs, 5.0f, rb);
-  sim.getPoses(rgeom, rfp, pp, rp, rfs, 15.0f, ra);
+  sim.getPoses(rgeom, rfp, pp, rp, rfs, noColliders, 5.0f, rb);
+  sim.getPoses(rgeom, rfp, pp, rp, rfs, noColliders, 15.0f, ra);
 
   double moveBefore = 0.0, moveAfter = 0.0;
   int activeBefore = 0;
@@ -499,23 +503,117 @@ void testSliceListRoundTrip() {
         "separators are lenient");
 }
 
+// A drawn obstacle has to actually stop things, end where it was drawn, and be
+// solid from both sides.
+void testColliders() {
+  const TestImage img = makeDiscs();
+  shp::ShapeParams sp;
+  sp.pattern = shp::Pattern::Alpha;
+  sp.buildPolygons = true;
+  auto geom = shp::buildGeometry(img.view(), nullptr, sp);
+  const shp::FrameScale fs = scaleOf(*geom);
+
+  shp::ForceParams fp;
+  fp.f1.enabled = true;
+  fp.f1.strength = 0.0f;   // no blast: just let them fall
+  shp::PhysicsParams pp;
+  pp.gravity = 6.0f;
+  pp.floorEnabled = false; // so the ONLY thing that can stop a piece is the shelf
+  pp.bounciness = 0.0f;
+  pp.collideShards = false;
+  shp::RenderParams rp;
+
+  // Without a shelf, everything falls out of the frame.
+  shp::SimCache freefall;
+  std::vector<shp::ShardPose> fell;
+  freefall.getPoses(geom, fp, pp, rp, fs, noColliders, 120.0f, fell);
+
+  int belowFrame = 0;
+  for (std::size_t i = 0; i < fell.size(); ++i)
+    if (geom->shards[i].cy + fell[i].y > fs.height) ++belowFrame;
+  check(belowFrame == int(fell.size()), "with no obstacle everything falls out of frame");
+
+  // A shelf right across the frame, below the discs, must catch all of them.
+  std::vector<shp::Collider> shelf(1);
+  shelf[0].x1 = 0.0f;
+  shelf[0].y1 = 0.95f;
+  shelf[0].x2 = 1.0f;
+  shelf[0].y2 = 0.95f;
+
+  shp::SimCache caught;
+  std::vector<shp::ShardPose> rest;
+  caught.getPoses(geom, fp, pp, rp, fs, shelf, 120.0f, rest);
+
+  int held = 0;
+  bool settled = true;
+  for (std::size_t i = 0; i < rest.size(); ++i) {
+    const float cy = geom->shards[i].cy + rest[i].y;
+    if (cy <= fs.height) ++held;
+    if (std::fabs(rest[i].vy) > 2.0f) settled = false;
+  }
+  check(held == int(rest.size()), "a drawn obstacle catches the pieces");
+  check(settled, "pieces come to rest on an obstacle rather than sinking through");
+
+  // A stub off to one side must catch nothing -- an obstacle ends where it was
+  // drawn, and does not secretly extend across the frame.
+  std::vector<shp::Collider> stub(1);
+  stub[0].x1 = 0.90f;
+  stub[0].y1 = 0.95f;
+  stub[0].x2 = 1.00f;
+  stub[0].y2 = 0.95f;
+
+  shp::SimCache missed;
+  std::vector<shp::ShardPose> past;
+  missed.getPoses(geom, fp, pp, rp, fs, stub, 120.0f, past);
+
+  int through = 0;
+  for (std::size_t i = 0; i < past.size(); ++i)
+    if (geom->shards[i].cy + past[i].y > fs.height) ++through;
+  check(through == int(past.size()), "an obstacle ends where it was drawn");
+
+  // Solid from below as well: thrown upward into the same shelf, nothing passes.
+  shp::PhysicsParams up = pp;
+  up.gravity = -6.0f;  // negative gravity, so "down" is up the screen
+  std::vector<shp::Collider> ceiling(1);
+  ceiling[0].x1 = 0.0f;
+  ceiling[0].y1 = 0.02f;
+  ceiling[0].x2 = 1.0f;
+  ceiling[0].y2 = 0.02f;
+
+  shp::SimCache upward;
+  std::vector<shp::ShardPose> hitCeiling;
+  upward.getPoses(geom, fp, up, rp, fs, ceiling, 120.0f, hitCeiling);
+
+  int stopped = 0;
+  for (std::size_t i = 0; i < hitCeiling.size(); ++i)
+    if (geom->shards[i].cy + hitCeiling[i].y > -10.0f) ++stopped;
+  check(stopped == int(hitCeiling.size()), "an obstacle is solid from both sides");
+
+  // And moving one must invalidate the cached run.
+  const uint64_t a = shp::HashSimParams(fp, pp, shelf);
+  std::vector<shp::Collider> moved = shelf;
+  moved[0].y1 = moved[0].y2 = 0.60f;
+  check(a != shp::HashSimParams(fp, pp, moved), "moving an obstacle rebuilds the simulation");
+  check(a != shp::HashSimParams(fp, pp, noColliders), "removing an obstacle rebuilds it too");
+}
+
 // Changing a render-only control must NOT invalidate the simulation, or every
 // fade tweak would re-run the physics.
 void testFadeDoesNotInvalidateSim() {
   shp::ForceParams fp;
   shp::PhysicsParams pp;
-  const uint64_t before = shp::HashSimParams(fp, pp);
+  const uint64_t before = shp::HashSimParams(fp, pp, noColliders);
 
   shp::RenderParams rp;
   rp.fadeDuration = 24.0f;
   rp.shrinkOnFade = true;
   (void)rp;  // render params are deliberately not part of the key
 
-  const uint64_t after = shp::HashSimParams(fp, pp);
+  const uint64_t after = shp::HashSimParams(fp, pp, noColliders);
   check(before == after, "sim key ignores render-only controls");
 
   pp.gravity += 0.5f;
-  check(shp::HashSimParams(fp, pp) != before, "sim key notices a gravity change");
+  check(shp::HashSimParams(fp, pp, noColliders) != before, "sim key notices a gravity change");
 }
 
 // Pieces must land on the floor and stay there, and must not sink through it.
@@ -540,7 +638,7 @@ void testPiecesRestOnFloor() {
 
   shp::SimCache sim;
   std::vector<shp::ShardPose> poses;
-  sim.getPoses(geom, fp, pp, rp, fs, 200.0f, poses);
+  sim.getPoses(geom, fp, pp, rp, fs, noColliders, 200.0f, poses);
 
   const float floorY = fs.height;
   bool allAbove = true;
@@ -758,6 +856,7 @@ int main() {
   testForceDelay();
   testManualSlices();
   testSliceListRoundTrip();
+  testColliders();
   testFadeDoesNotInvalidateSim();
   testPiecesRestOnFloor();
   testRestFrameReproducesSource();

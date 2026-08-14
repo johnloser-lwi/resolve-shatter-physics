@@ -95,7 +95,8 @@ int clipSegment(const Vec2 in[2], const Vec2& n, float offset, Vec2 out[2]) {
 // ---------------------------------------------------------------------------
 
 void World::reset(const std::vector<Shard>& shards, const ForceParams& fp,
-                  const PhysicsParams& pp, const FrameScale& fs) {
+                  const PhysicsParams& pp, const FrameScale& fs,
+                  const std::vector<Collider>& colliders) {
   _params = WorldParams{};
   _params.gravity = GravityVector(pp, fs);
   _params.drag = pp.viscosity * kDragScale;
@@ -116,6 +117,20 @@ void World::reset(const std::vector<Shard>& shards, const ForceParams& fp,
   _bodies.resize(shards.size());
   _contacts.clear();
   _time = float(fp.startFrame);
+
+  // Resolved to pixels once, here, rather than per substep. Everything else in
+  // the solver works in pixels, and converting inside the contact loop would be
+  // the same multiply a few hundred thousand times a frame.
+  _colliders.clear();
+  _colliders.reserve(colliders.size());
+  for (const Collider& c : colliders) {
+    Collider p;
+    p.x1 = c.x1 * fs.width;
+    p.y1 = c.y1 * fs.height;
+    p.x2 = c.x2 * fs.width;
+    p.y2 = c.y2 * fs.height;
+    _colliders.push_back(p);
+  }
 
   for (std::size_t i = 0; i < shards.size(); ++i) {
     const Shard& sh = shards[i];
@@ -295,6 +310,74 @@ void World::collectStaticContacts() {
       c.point = _worldVerts[std::size_t(deepest)];
       c.depth = -sep;
       _contacts.push_back(c);
+    }
+  }
+}
+
+void World::collectColliderContacts() {
+  if (_colliders.empty()) return;
+
+  // How solid a drawn line is. A collider has no thickness of its own, so
+  // without this a shard would come to rest with its corner exactly on the line
+  // and read as balancing on nothing.
+  constexpr float kHalfThickness = 1.5f;
+
+  for (std::size_t i = 0; i < _bodies.size(); ++i) {
+    Body& b = _bodies[i];
+    if (!b.active || b.culled || b.invMass <= 0.0f || b.local.empty()) continue;
+
+    transformHull(b, _worldVerts);
+    const Vec2 centre = b.worldPos();
+
+    for (const Collider& c : _colliders) {
+      const Vec2 a(c.x1, c.y1);
+      const Vec2 e(c.x2, c.y2);
+      const Vec2 ab = e - a;
+      const float len2 = LengthSq(ab);
+      if (len2 < 1.0f) continue;  // a click, not a line
+
+      // Cheap reject: the whole body is further from the line than it is wide.
+      Vec2 n = Normalize(Vec2(ab.y, -ab.x));
+      if (n.x == 0.0f && n.y == 0.0f) continue;
+
+      // A drawn line is solid from BOTH sides, so which way it pushes depends on
+      // which side the shard came from. Orienting the normal toward the body's
+      // centre each substep is what gives that, and it is why a collider can be
+      // landed on from above and bounced off from below without being two
+      // different objects.
+      const float side = Dot(centre - a, n);
+      if (side < 0.0f) n = -n;
+
+      if (fabsf(side) > b.radius + kHalfThickness) continue;
+
+      // The deepest vertex that is actually alongside the segment. Vertices past
+      // either end are ignored, which is what makes the collider finite -- a
+      // shard sliding off the end of a ramp keeps going instead of catching on
+      // an invisible infinite wall.
+      int deepest = -1;
+      float depth = 0.0f;
+      for (std::size_t v = 0; v < _worldVerts.size(); ++v) {
+        const Vec2 rel = _worldVerts[v] - a;
+        const float t = Dot(rel, ab) / len2;
+        if (t < 0.0f || t > 1.0f) continue;
+
+        const float d = kHalfThickness - Dot(rel, n);  // > 0 means inside
+        if (d > depth) {
+          depth = d;
+          deepest = int(v);
+        }
+      }
+      if (deepest < 0) continue;
+
+      Contact ct;
+      ct.a = int(i);
+      ct.b = -1;
+      // From A toward the obstacle, matching the convention the solver and the
+      // floor contacts both use.
+      ct.normal = -n;
+      ct.point = _worldVerts[std::size_t(deepest)];
+      ct.depth = depth;
+      _contacts.push_back(ct);
     }
   }
 }
@@ -549,6 +632,7 @@ void World::step(float frame) {
 
     _contacts.clear();
     collectStaticContacts();
+    collectColliderContacts();
     collectShardContacts();
     solveContacts(dt);
   }

@@ -215,6 +215,7 @@ int main(int argc, char** argv) {
   float atTime = -1.0f;
   bool rigid = false;
   int bench = 0;
+  std::vector<shp::Collider> colliders;
 
   for (int i = 3; i < argc; ++i) {
     const std::string a = argv[i];
@@ -272,6 +273,11 @@ int main(int argc, char** argv) {
       shp::Slice sl;
       if (parseSlice(argv[++i], sl)) sp.slices.push_back(sl);
     }
+    else if (a == "--collider" && i + 1 < argc) {
+      shp::Collider co;
+      if (std::sscanf(argv[++i], "%f,%f,%f,%f", &co.x1, &co.y1, &co.x2, &co.y2) == 4)
+        colliders.push_back(co);
+    }
   }
 
   Bitmap src;
@@ -316,7 +322,7 @@ int main(int argc, char** argv) {
     out.h = src.h;
     out.px.assign(std::size_t(out.w) * std::size_t(out.h) * 4, 0.0f);
     if (rigid) {
-      sim.getPoses(geom, fp, pp, rp, fs, t, poses);
+      sim.getPoses(geom, fp, pp, rp, fs, colliders, t, poses);
     } else {
       shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, t, poses);
     }

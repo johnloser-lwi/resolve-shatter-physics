@@ -27,6 +27,28 @@
 #include <vector>
 
 namespace shp {
+
+/** @brief A static obstacle drawn by hand, in normalized [0,1] coordinates.
+ *
+ * A line segment, deliberately: it is the same gesture as a slice, it is trivial
+ * to draw accurately, and a chain of them makes any shape worth having -- a
+ * ramp, a funnel, a shelf, a wall at an angle. Filled polygons would need
+ * winding rules and inside/outside tests to buy very little a chain of segments
+ * cannot already do.
+ *
+ * Deliberately NOT part of PhysicsParams. That struct is passed by reference to
+ * functions marked SHP_HD, and giving it a std::vector member would make a
+ * device-compiled header depend on host-only types.
+ */
+struct Collider {
+  float x1 = 0.0f, y1 = 0.0f;
+  float x2 = 0.0f, y2 = 0.0f;
+
+  bool operator==(const Collider& o) const {
+    return x1 == o.x1 && y1 == o.y1 && x2 == o.x2 && y2 == o.y2;
+  }
+};
+
 namespace phys {
 
 struct Body {
@@ -92,7 +114,7 @@ struct WorldParams {
 class World {
  public:
   void reset(const std::vector<Shard>& shards, const ForceParams& fp, const PhysicsParams& pp,
-             const FrameScale& fs);
+             const FrameScale& fs, const std::vector<Collider>& colliders);
 
   /// Advance exactly one frame, in `substeps` equal pieces.
   /// @param frame the frame being stepped INTO. Bodies whose detach time has
@@ -113,6 +135,7 @@ class World {
   void solveContacts(float dt);
   void collectShardContacts();
   void collectStaticContacts();
+  void collectColliderContacts();
 
   struct Contact {
     int a = -1;          ///< body index; b < 0 means a static plane
@@ -126,6 +149,7 @@ class World {
 
   std::vector<Body> _bodies;
   std::vector<Contact> _contacts;
+  std::vector<Collider> _colliders;   ///< absolute pixels, resolved at reset
   WorldParams _params;
   float _time = 0.0f;
 

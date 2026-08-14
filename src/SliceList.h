@@ -24,8 +24,20 @@ namespace shp {
 /// a limit on the interface, not on the maths.
 constexpr int kMaxSlices = 64;
 
-inline std::vector<Slice> ParseSlices(const std::string& in) {
-  std::vector<Slice> out;
+/// Obstacles are tested against every moving piece every substep, so the ceiling
+/// is lower than for cuts -- which are rasterised once and then forgotten.
+constexpr int kMaxColliders = 32;
+
+/** @brief Parse a list of segments from text.
+ *
+ * Templated because two different things are stored this way -- the cuts that
+ * decide how the image breaks, and the colliders the simulation bounces off.
+ * They are separate concepts with separate parameters, but the text format is
+ * the same four numbers, and one parser that both use cannot drift.
+ */
+template <class T>
+inline std::vector<T> ParseSegments(const std::string& in, int limit) {
+  std::vector<T> out;
 
   // Any run of characters that is not part of a number separates, so commas,
   // semicolons, spaces and newlines all behave the same and a trailing
@@ -34,7 +46,7 @@ inline std::vector<Slice> ParseSlices(const std::string& in) {
   int have = 0;
   std::size_t i = 0;
 
-  while (i <= in.size() && int(out.size()) < kMaxSlices) {
+  while (i <= in.size() && int(out.size()) < limit) {
     // Skip anything that cannot begin a number.
     while (i < in.size() && in[i] != '-' && in[i] != '+' && in[i] != '.' &&
            !(in[i] >= '0' && in[i] <= '9'))
@@ -51,7 +63,7 @@ inline std::vector<Slice> ParseSlices(const std::string& in) {
 
     v[have++] = f;
     if (have == 4) {
-      Slice s;
+      T s;
       s.x1 = v[0];
       s.y1 = v[1];
       s.x2 = v[2];
@@ -63,18 +75,27 @@ inline std::vector<Slice> ParseSlices(const std::string& in) {
   return out;  // a trailing partial group is dropped, which is what half-typed means
 }
 
-inline std::string FormatSlices(const std::vector<Slice>& slices) {
+template <class T>
+inline std::string FormatSegments(const std::vector<T>& segs) {
   std::string out;
   char buf[96];
-  for (std::size_t i = 0; i < slices.size(); ++i) {
-    const Slice& s = slices[i];
+  for (std::size_t i = 0; i < segs.size(); ++i) {
+    const T& s = segs[i];
     // Four decimals is about a fifth of a pixel at UHD -- finer than anyone can
-    // drag, and short enough that a dozen cuts still fit in a readable field.
+    // drag, and short enough that a dozen entries still fit in a readable field.
     std::snprintf(buf, sizeof(buf), "%s%.4f,%.4f,%.4f,%.4f", i ? "; " : "", s.x1, s.y1, s.x2,
                   s.y2);
     out += buf;
   }
   return out;
+}
+
+inline std::vector<Slice> ParseSlices(const std::string& in) {
+  return ParseSegments<Slice>(in, kMaxSlices);
+}
+
+inline std::string FormatSlices(const std::vector<Slice>& slices) {
+  return FormatSegments(slices);
 }
 
 }  // namespace shp

@@ -178,6 +178,24 @@ enough that settings translate by eye.
 Both modes launch every piece with identical initial conditions, so switching
 between them changes how pieces *interact*, not where they were thrown.
 
+### Drawing obstacles
+
+Rigid Body only. Turn on **Collider Tool** and drag across the viewer to draw
+something for the pieces to hit. Each drag adds one line; chain several together
+to make a ramp, a funnel, a shelf, or a wall at an angle. Endpoints are
+draggable, and **Clear Obstacles** removes them all.
+
+An obstacle is solid from **both sides** — the contact normal is oriented toward
+whichever side the piece approached from each substep, so the same line can be
+landed on from above and bounced off from below without being two objects. It
+also **ends where you stopped drawing**: a piece sliding off the end of a ramp
+keeps going rather than catching on an invisible extension. Obstacles are stored
+in the **Obstacles** field in the same format as cuts, and there is a cap of 32
+because every one of them is tested against every moving piece every substep.
+
+Moving an obstacle rebuilds the cached simulation, the same as any other physics
+change.
+
 ### Render
 
 Fade Out (0 means pieces never fade), Shrink While Fading, Smooth Edges, Motion
@@ -411,6 +429,17 @@ letter also slices whatever else lies along that line. Barriers cost a fill pass
 and are worth it. The barrier radius is 0.75 px rather than 0.5 because an
 eight-connected labeller steps diagonally: a thinner diagonal cut leaks, and it
 leaks as a function of the angle, which is the worst kind of intermittent.
+
+**A drawn obstacle picks its normal from which side the piece is on, every
+substep.** That is what makes one line solid from both directions. The
+alternative -- baking a side in when it is drawn -- would mean a ramp you can
+land on but fall up through, and the bug would only show on the pieces that
+happened to arrive from underneath.
+
+**Colliders are deliberately not part of `PhysicsParams`.** That struct is passed
+by reference into `SHP_HD` functions, so giving it a `std::vector` member would
+make a device-compiled header depend on host-only types. They travel alongside
+instead, and they are hashed into the simulation key by hand.
 
 **Forces are impulses with a time, not a launch velocity.** Folding a delayed
 force into how a piece left would be simpler and would look completely wrong: the

@@ -36,8 +36,19 @@ inline void mixForce(uint64_t& h, const ForceField& f) {
 
 }  // namespace
 
-uint64_t HashSimParams(const ForceParams& fp, const PhysicsParams& pp) {
+uint64_t HashSimParams(const ForceParams& fp, const PhysicsParams& pp,
+                       const std::vector<Collider>& colliders) {
   uint64_t h = 1469598103934665603ull;  // FNV-1a offset basis
+
+  // Order matters and is preserved, so moving a collider changes the key even if
+  // the set of positions happens to be the same afterwards.
+  mix(h, uint64_t(colliders.size()));
+  for (const Collider& c : colliders) {
+    mixF(h, c.x1);
+    mixF(h, c.y1);
+    mixF(h, c.x2);
+    mixF(h, c.y2);
+  }
 
   mixForce(h, fp.f1);
   mixForce(h, fp.f2);
@@ -67,14 +78,15 @@ uint64_t HashSimParams(const ForceParams& fp, const PhysicsParams& pp) {
 }
 
 void SimCache::rebuild(const std::shared_ptr<const ShatterGeometry>& geom, const ForceParams& fp,
-                       const PhysicsParams& pp, const FrameScale& fs) {
+                       const PhysicsParams& pp, const FrameScale& fs,
+                       const std::vector<Collider>& colliders) {
   _geomKeepAlive = geom;
   _fp = fp;
   _pp = pp;
   _fs = fs;
   _startFrame = fp.startFrame;
 
-  _world.reset(geom->shards, fp, pp, fs);
+  _world.reset(geom->shards, fp, pp, fs, colliders);
   _frames.clear();
   _simulatedUpTo = -1;
 
@@ -115,7 +127,8 @@ void SimCache::extendTo(int frame) {
 
 void SimCache::getPoses(const std::shared_ptr<const ShatterGeometry>& geom, const ForceParams& fp,
                         const PhysicsParams& pp, const RenderParams& rp, const FrameScale& fs,
-                        float t, std::vector<ShardPose>& out) {
+                        const std::vector<Collider>& colliders, float t,
+                        std::vector<ShardPose>& out) {
   if (!geom || geom->shards.empty()) {
     out.clear();
     return;
@@ -125,11 +138,11 @@ void SimCache::getPoses(const std::shared_ptr<const ShatterGeometry>& geom, cons
 
   SimKey key;
   key.geom = geom.get();
-  key.paramHash = HashSimParams(fp, pp);
+  key.paramHash = HashSimParams(fp, pp, colliders);
 
   if (key != _key || _frames.empty()) {
     _key = key;
-    rebuild(geom, fp, pp, fs);
+    rebuild(geom, fp, pp, fs, colliders);
   }
 
   // Before the shatter starts there is nothing to look up: every piece is at

@@ -183,6 +183,8 @@ class ShatterPhysicsPlugin : public OFX::ImageEffect {
     _floorY = fetchDoubleParam(shp::kParamFloorY);
     _wallsEnabled = fetchBooleanParam(shp::kParamWallsEnabled);
     _substeps = fetchIntParam(shp::kParamSubsteps);
+    _colliders = fetchStringParam(shp::kParamColliders);
+    _colliderTool = fetchBooleanParam(shp::kParamColliderTool);
 
     _startFrame = fetchIntParam(shp::kParamStartFrame);
     _seed = fetchIntParam(shp::kParamSeed);
@@ -217,6 +219,7 @@ class ShatterPhysicsPlugin : public OFX::ImageEffect {
  private:
   shp::ShapeParams readShape(double t) const;
   shp::ForceParams readForces(double t) const;
+  std::vector<shp::Collider> readColliders(double t) const;
   shp::PhysicsParams readPhysics(double t) const;
   shp::RenderParams readRender(double t) const;
   void syncVisibility();
@@ -276,6 +279,8 @@ class ShatterPhysicsPlugin : public OFX::ImageEffect {
   OFX::DoubleParam* _floorY = nullptr;
   OFX::BooleanParam* _wallsEnabled = nullptr;
   OFX::IntParam* _substeps = nullptr;
+  OFX::StringParam* _colliders = nullptr;
+  OFX::BooleanParam* _colliderTool = nullptr;
 
   OFX::IntParam* _startFrame = nullptr;
   OFX::IntParam* _seed = nullptr;
@@ -421,6 +426,12 @@ shp::PhysicsParams ShatterPhysicsPlugin::readPhysics(double t) const {
   return pp;
 }
 
+std::vector<shp::Collider> ShatterPhysicsPlugin::readColliders(double t) const {
+  std::string s;
+  _colliders->getValueAtTime(t, s);
+  return shp::ParseSegments<shp::Collider>(s, shp::kMaxColliders);
+}
+
 shp::RenderParams ShatterPhysicsPlugin::readRender(double t) const {
   shp::RenderParams rp;
   double d = 0.0;
@@ -475,6 +486,10 @@ void ShatterPhysicsPlugin::syncVisibility() {
   _floorY->setIsSecret(!rigid);
   _wallsEnabled->setIsSecret(!rigid);
   _substeps->setIsSecret(!rigid);
+  // Obstacles only mean anything to the solver, so in Ballistic they would be a
+  // tool that draws lines nothing ever hits.
+  _colliderTool->setIsSecret(!rigid);
+  _colliders->setIsSecret(!rigid);
 
   // The fade sub-controls mean nothing while the fade is switched off.
   double dur = 0.0;
@@ -498,6 +513,23 @@ void ShatterPhysicsPlugin::changedParam(const OFX::InstanceChangedArgs&,
       // -- without that it keeps serving frames cut with the old slices.
       shp::EditBlock block(this, "Clear Cuts");
       _slices->setValue("");
+      return;
+    }
+    if (name == shp::kParamClearColliders) {
+      shp::EditBlock block(this, "Clear Obstacles");
+      _colliders->setValue("");
+      return;
+    }
+    // The two drawing tools interpret the same drag differently, so only one can
+    // be armed. Turning one on turns the other off rather than leaving the
+    // viewer in a state where it is unclear what a drag will do.
+    if (name == shp::kParamSliceTool || name == shp::kParamColliderTool) {
+      bool on = false;
+      (name == shp::kParamSliceTool ? _sliceTool : _colliderTool)->getValue(on);
+      if (on) {
+        shp::EditBlock block(this, "Drawing Tool");
+        (name == shp::kParamSliceTool ? _colliderTool : _sliceTool)->setValue(false);
+      }
       return;
     }
     if (name == shp::kParamPattern || name == shp::kParamForceMode ||
@@ -643,7 +675,7 @@ bool ShatterPhysicsPlugin::renderCuda(const OFX::RenderArguments& args, OFX::Ima
 
   std::lock_guard<std::mutex> lock(_scratchMutex);
   if (rigid) {
-    _sim.getPoses(geom, fp, pp, rp, fs, float(clipT), _poses);
+    _sim.getPoses(geom, fp, pp, rp, fs, readColliders(t), float(clipT), _poses);
   } else {
     shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, float(clipT), _poses);
   }
@@ -771,7 +803,7 @@ void ShatterPhysicsPlugin::render(const OFX::RenderArguments& args) {
     // Steps forward from the start frame on a cache miss, then serves stored
     // poses. Scrubbing backward is a lookup; the first render deep into a clip
     // pays for the whole prefix once.
-    _sim.getPoses(geom, fp, pp, rp, fs, float(clipT), _poses);
+    _sim.getPoses(geom, fp, pp, rp, fs, readColliders(t), float(clipT), _poses);
   } else {
     shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, float(clipT), _poses);
   }
@@ -1284,6 +1316,33 @@ void ShatterPhysicsFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
     p->setHint("Keep pieces inside the frame by bouncing them off the left and right edges.");
     p->setDefault(false);
     addParam(page, p, gPhys);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam(shp::kParamColliderTool);
+    p->setLabels("Collider Tool", "Collider Tool", "Collider Tool");
+    p->setHint(
+        "Turn this on and drag across the viewer to draw an obstacle for the "
+        "pieces to hit. Each drag adds one line. Chain several together to make "
+        "a ramp, a funnel, a shelf, or a wall at an angle.\n\n"
+        "Obstacles are solid from both sides, and they end where you stopped "
+        "drawing -- a piece sliding off the end of a ramp keeps going.");
+    p->setDefault(false);
+    addParamUI(page, p, gPhys);  // a viewer mode, not a value the render reads
+  }
+  {
+    OFX::StringParamDescriptor* p = desc.defineStringParam(shp::kParamColliders);
+    p->setLabels("Obstacles", "Obstacles", "Obstacles");
+    p->setHint(
+        "The obstacles you have drawn, as x1,y1,x2,y2 in fractions of the "
+        "frame. Editable by hand, and safe to copy between clips.");
+    p->setDefault("");
+    addParam(page, p, gPhys);
+  }
+  {
+    OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam(shp::kParamClearColliders);
+    p->setLabels("Clear Obstacles", "Clear Obstacles", "Clear Obstacles");
+    p->setHint("Remove every hand-drawn obstacle. Undo brings them back.");
+    addParamUI(page, p, gPhys);
   }
   {
     OFX::IntParamDescriptor* p = desc.defineIntParam(shp::kParamSubsteps);

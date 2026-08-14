@@ -100,7 +100,13 @@ constexpr const char* kParamCollideShards    = "collideShards";
 constexpr const char* kParamFloorEnabled     = "floorEnabled";
 constexpr const char* kParamFloorY           = "floorY";
 constexpr const char* kParamWallsEnabled     = "wallsEnabled";
-constexpr const char* kParamSubsteps         = "substeps";
+constexpr const char* kParamSubsteps          = "substeps";
+
+// Obstacles drawn by hand for the simulation to bounce off. Rigid Body only --
+// the ballistic mode has no collisions of any kind to hook them into.
+constexpr const char* kParamColliders        = "colliders";
+constexpr const char* kParamColliderTool     = "colliderTool";
+constexpr const char* kParamClearColliders   = "clearColliders";
 
 enum SimModeIndex {
   kSimBallistic = 0,   // closed form, evaluated at any t, no collisions

@@ -132,10 +132,20 @@ struct ForceView {
   double delay = 0.0;
 };
 
-enum class Grab { None, Centre, Radius, Width, Direction, SliceEnd, SliceNew };
+enum class Grab { None, Centre, Radius, Width, Direction, SegEnd, SegNew };
 
 constexpr Colour kCut = {1.00f, 0.28f, 0.34f, 0.95f};
-constexpr Colour kCutPending = {1.00f, 0.85f, 0.30f, 0.95f};
+constexpr Colour kObstacle = {0.25f, 0.95f, 0.72f, 0.95f};
+constexpr Colour kPending = {1.00f, 0.85f, 0.30f, 0.95f};
+
+/// The two drawing tools share their gesture, their storage format and their
+/// handles; only the parameter they write and the colour they draw in differ.
+/// One code path for both is what keeps them behaving identically.
+struct SegmentList {
+  const char* param;
+  Colour colour;
+  const char* caption;
+};
 
 // How far from the centre the rotate handle sits, in screen pixels. Fixed on
 // screen rather than in image space so the gesture feels the same at any zoom.
@@ -177,6 +187,8 @@ class ForceInteract : public OFX::OverlayInteract {
       // redraw, so a cut just drawn would appear to have been ignored.
       addParamToSlaveTo(_effect->fetchStringParam(kParamSlices));
       addParamToSlaveTo(_effect->fetchBooleanParam(kParamSliceTool));
+      addParamToSlaveTo(_effect->fetchStringParam(kParamColliders));
+      addParamToSlaveTo(_effect->fetchBooleanParam(kParamColliderTool));
     } catch (...) {
     }
   }
@@ -185,7 +197,10 @@ class ForceInteract : public OFX::OverlayInteract {
     Ctx c;
     if (!build(c, args.pixelScale, gDrawContext)) return false;
 
-    drawSlices(c, args.time);
+    // Obstacles under cuts: a cut changes what the pieces ARE, so it is the more
+    // important of the two to be able to see clearly.
+    drawList(c, args.time, /*colliders=*/true);
+    drawList(c, args.time, /*colliders=*/false);
 
     // Force 2 first, so Force 1 lands on top -- it is the one enabled by
     // default and the one most drags are aimed at.
@@ -198,33 +213,43 @@ class ForceInteract : public OFX::OverlayInteract {
     Ctx c;
     if (!build(c, args.pixelScale, nullptr)) return false;
 
-    // Existing cut endpoints come first: once a cut is drawn, adjusting it is
-    // the commoner intent than drawing another one straight through it.
-    {
-      const std::vector<Slice> cuts = readSlices(args.time);
-      for (std::size_t i = 0; i < cuts.size(); ++i) {
+    // Endpoints of whichever tool is armed come first: once a line is drawn,
+    // adjusting it is the commoner intent than drawing another through it. Only
+    // the armed tool's endpoints are grabbable, so cuts and obstacles lying on
+    // top of each other never fight over a click.
+    for (int pass = 0; pass < 2; ++pass) {
+      const bool colliders = pass == 0;
+      if (!toolOn(args.time, colliders)) continue;
+
+      const std::vector<Slice> segs = readList(args.time, colliders);
+      for (std::size_t i = 0; i < segs.size(); ++i) {
         for (int e = 0; e < 2; ++e) {
-          const OfxPointD p = c.toCanonical(e == 0 ? cuts[i].x1 : cuts[i].x2,
-                                            e == 0 ? cuts[i].y1 : cuts[i].y2);
+          const OfxPointD p = c.toCanonical(e == 0 ? segs[i].x1 : segs[i].x2,
+                                            e == 0 ? segs[i].y1 : segs[i].y2);
           if (nearPoint(c, args.penPosition, p.x, p.y)) {
-            _sliceIndex = int(i);
-            _sliceEnd = e;
-            _grab = Grab::SliceEnd;
-            BeginEdit(_effect, "Move Cut");
+            _segIndex = int(i);
+            _segEnd = e;
+            _onColliders = colliders;
+            _grab = Grab::SegEnd;
+            BeginEdit(_effect, colliders ? "Move Obstacle" : "Move Cut");
             return true;
           }
         }
       }
     }
 
-    // With the tool armed, a drag anywhere else starts a new cut.
-    if (sliceToolOn(args.time)) {
+    // With a tool armed, a drag anywhere else starts a new line.
+    for (int pass = 0; pass < 2; ++pass) {
+      const bool colliders = pass == 0;
+      if (!toolOn(args.time, colliders)) continue;
+
       double nx = 0.0, ny = 0.0;
       c.toNormalized(args.penPosition, nx, ny);
       _pending.x1 = _pending.x2 = float(nx);
       _pending.y1 = _pending.y2 = float(ny);
-      _grab = Grab::SliceNew;
-      BeginEdit(_effect, "Add Cut");
+      _onColliders = colliders;
+      _grab = Grab::SegNew;
+      BeginEdit(_effect, colliders ? "Add Obstacle" : "Add Cut");
       return true;
     }
 
@@ -272,27 +297,27 @@ class ForceInteract : public OFX::OverlayInteract {
 
     // Cuts are handled before the forces because they have their own storage --
     // a string parameter rather than a pair of doubles.
-    if (_grab == Grab::SliceNew) {
+    if (_grab == Grab::SegNew) {
       double nx = 0.0, ny = 0.0;
       c.toNormalized(args.penPosition, nx, ny);
       _pending.x2 = float(nx);
       _pending.y2 = float(ny);
       return true;
     }
-    if (_grab == Grab::SliceEnd) {
+    if (_grab == Grab::SegEnd) {
       try {
-        std::vector<Slice> cuts = readSlices(args.time);
-        if (_sliceIndex >= 0 && _sliceIndex < int(cuts.size())) {
+        std::vector<Slice> segs = readList(args.time, _onColliders);
+        if (_segIndex >= 0 && _segIndex < int(segs.size())) {
           double nx = 0.0, ny = 0.0;
           c.toNormalized(args.penPosition, nx, ny);
-          if (_sliceEnd == 0) {
-            cuts[std::size_t(_sliceIndex)].x1 = float(nx);
-            cuts[std::size_t(_sliceIndex)].y1 = float(ny);
+          if (_segEnd == 0) {
+            segs[std::size_t(_segIndex)].x1 = float(nx);
+            segs[std::size_t(_segIndex)].y1 = float(ny);
           } else {
-            cuts[std::size_t(_sliceIndex)].x2 = float(nx);
-            cuts[std::size_t(_sliceIndex)].y2 = float(ny);
+            segs[std::size_t(_segIndex)].x2 = float(nx);
+            segs[std::size_t(_segIndex)].y2 = float(ny);
           }
-          writeSlices(cuts);
+          writeList(segs, _onColliders);
         }
       } catch (...) {
       }
@@ -348,9 +373,9 @@ class ForceInteract : public OFX::OverlayInteract {
   bool penUp(const OFX::PenArgs& args) override {
     if (_grab == Grab::None) return false;
 
-    if (_grab == Grab::SliceNew) {
-      // A drag that went nowhere is a click, not a cut. Committing it would
-      // leave a zero-length entry that cuts nothing and still has to be found
+    if (_grab == Grab::SegNew) {
+      // A drag that went nowhere is a click, not a line. Committing it would
+      // leave a zero-length entry that does nothing and still has to be found
       // and deleted.
       Ctx c;
       const bool haveCtx = build(c, args.pixelScale, nullptr);
@@ -358,10 +383,10 @@ class ForceInteract : public OFX::OverlayInteract {
       const double dy = double(_pending.y2 - _pending.y1) * (haveCtx ? c.height() : 1.0);
       if (dx * dx + dy * dy >= 9.0) {
         try {
-          std::vector<Slice> cuts = readSlices(args.time);
-          if (int(cuts.size()) < kMaxSlices) {
-            cuts.push_back(_pending);
-            writeSlices(cuts);
+          std::vector<Slice> segs = readList(args.time, _onColliders);
+          if (int(segs.size()) < (_onColliders ? kMaxColliders : kMaxSlices)) {
+            segs.push_back(_pending);
+            writeList(segs, _onColliders);
           }
         } catch (...) {
         }
@@ -410,71 +435,78 @@ class ForceInteract : public OFX::OverlayInteract {
     EndEdit(_effect);
   }
 
-  bool sliceToolOn(double t) const {
+  static SegmentList listFor(bool colliders) {
+    return colliders ? SegmentList{kParamColliders, kObstacle, "Collider Tool: drag to draw"}
+                     : SegmentList{kParamSlices, kCut, "Slice Tool: drag to cut"};
+  }
+
+  bool toolOn(double t, bool colliders) const {
     bool on = false;
     try {
-      _effect->fetchBooleanParam(kParamSliceTool)->getValueAtTime(t, on);
+      _effect->fetchBooleanParam(colliders ? kParamColliderTool : kParamSliceTool)
+          ->getValueAtTime(t, on);
     } catch (...) {
     }
     return on;
   }
 
-  std::vector<Slice> readSlices(double t) const {
+  std::vector<Slice> readList(double t, bool colliders) const {
     std::string s;
     try {
-      _effect->fetchStringParam(kParamSlices)->getValueAtTime(t, s);
+      _effect->fetchStringParam(listFor(colliders).param)->getValueAtTime(t, s);
     } catch (...) {
     }
-    return ParseSlices(s);
+    return ParseSegments<Slice>(s, colliders ? kMaxColliders : kMaxSlices);
   }
 
-  void writeSlices(const std::vector<Slice>& cuts) const {
-    _effect->fetchStringParam(kParamSlices)->setValue(FormatSlices(cuts));
+  void writeList(const std::vector<Slice>& segs, bool colliders) const {
+    _effect->fetchStringParam(listFor(colliders).param)->setValue(FormatSegments(segs));
   }
 
-  void drawSlices(const Ctx& c, double t) {
-    const std::vector<Slice> cuts = readSlices(t);
-    const bool tool = sliceToolOn(t);
+  void drawList(const Ctx& c, double t, bool colliders) {
+    const std::vector<Slice> segs = readList(t, colliders);
+    const bool tool = toolOn(t, colliders);
+    const SegmentList def = listFor(colliders);
 
-    for (std::size_t i = 0; i < cuts.size(); ++i) {
-      const OfxPointD a = c.toCanonical(cuts[i].x1, cuts[i].y1);
-      const OfxPointD b = c.toCanonical(cuts[i].x2, cuts[i].y2);
+    for (std::size_t i = 0; i < segs.size(); ++i) {
+      const OfxPointD a = c.toCanonical(segs[i].x1, segs[i].y1);
+      const OfxPointD b = c.toCanonical(segs[i].x2, segs[i].y2);
 
-      // Drawn dark-then-light so a cut stays readable over both bright and dark
-      // footage, which matters more here than anywhere else on the overlay --
-      // a cut you cannot see is a cut you cannot fix.
+      // Drawn dark-then-light so a line stays readable over both bright and dark
+      // footage, which matters more here than anywhere else on the overlay -- a
+      // cut you cannot see is a cut you cannot fix.
       setColour(c, kShadow);
       c.draw->setLineWidth(c.ctx, 3.0f);
       line(c, a.x, a.y, b.x, b.y);
-      setColour(c, kCut);
+      setColour(c, def.colour);
       c.draw->setLineWidth(c.ctx, 1.0f);
       line(c, a.x, a.y, b.x, b.y);
 
-      // Endpoint handles only while the tool is armed. Left on permanently they
-      // would clutter the viewer for anyone using a generated pattern who has
-      // no interest in the cuts.
+      // Endpoint handles only while the matching tool is armed. Left on
+      // permanently they would clutter the viewer for anyone who has finished
+      // drawing and is now tuning the physics.
       if (tool) {
-        handle(c, a.x, a.y, kCut, 4.0);
-        handle(c, b.x, b.y, kCut, 4.0);
+        handle(c, a.x, a.y, def.colour, 4.0);
+        handle(c, b.x, b.y, def.colour, 4.0);
       }
     }
 
-    // The cut currently being dragged, in a different colour so it is obviously
+    // The line currently being dragged, in a different colour so it is obviously
     // not committed yet.
-    if (_grab == Grab::SliceNew) {
+    if (_grab == Grab::SegNew && _onColliders == colliders) {
       const OfxPointD a = c.toCanonical(_pending.x1, _pending.y1);
       const OfxPointD b = c.toCanonical(_pending.x2, _pending.y2);
       setColour(c, kShadow);
       c.draw->setLineWidth(c.ctx, 3.0f);
       line(c, a.x, a.y, b.x, b.y);
-      setColour(c, kCutPending);
+      setColour(c, kPending);
       c.draw->setLineWidth(c.ctx, 1.0f);
       line(c, a.x, a.y, b.x, b.y);
     }
 
     if (tool) {
       setColour(c, kLabel);
-      text(c, "Slice Tool: drag to cut", c.rod.x1 + c.sx(16.0), c.rod.y2 - c.sy(20.0));
+      text(c, def.caption, c.rod.x1 + c.sx(16.0), c.rod.y2 - c.sy(20.0));
     }
   }
 
@@ -627,9 +659,10 @@ class ForceInteract : public OFX::OverlayInteract {
   Grab _grab = Grab::None;
   int _which = 0;
 
-  Slice _pending;         ///< the cut being dragged, not yet committed
-  int _sliceIndex = -1;
-  int _sliceEnd = 0;
+  Slice _pending;          ///< the line being dragged, not yet committed
+  int _segIndex = -1;
+  int _segEnd = 0;
+  bool _onColliders = false;  ///< which list the current drag belongs to
 };
 
 // Wraps the Support library's interact entry so the draw context, which only

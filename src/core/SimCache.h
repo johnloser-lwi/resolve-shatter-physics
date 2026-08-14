@@ -54,7 +54,8 @@ struct SimKey {
  * Hashing the raw bytes of the structs would be shorter and wrong: padding is
  * uninitialised, so two identical settings could hash differently and quietly
  * force a rebuild on every frame. */
-uint64_t HashSimParams(const ForceParams& fp, const PhysicsParams& pp);
+uint64_t HashSimParams(const ForceParams& fp, const PhysicsParams& pp,
+                       const std::vector<Collider>& colliders);
 
 class SimCache {
  public:
@@ -66,12 +67,13 @@ class SimCache {
    * than starting a second one.
    */
   void getPoses(const std::shared_ptr<const ShatterGeometry>& geom, const ForceParams& fp,
-                const PhysicsParams& pp, const RenderParams& rp, const FrameScale& fs, float t,
-                std::vector<ShardPose>& out);
+                const PhysicsParams& pp, const RenderParams& rp, const FrameScale& fs,
+                const std::vector<Collider>& colliders, float t, std::vector<ShardPose>& out);
 
  private:
   void rebuild(const std::shared_ptr<const ShatterGeometry>& geom, const ForceParams& fp,
-               const PhysicsParams& pp, const FrameScale& fs);
+               const PhysicsParams& pp, const FrameScale& fs,
+               const std::vector<Collider>& colliders);
   void extendTo(int frame);
   void snapshot();
 
