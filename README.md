@@ -180,21 +180,39 @@ between them changes how pieces *interact*, not where they were thrown.
 
 ### Drawing obstacles
 
-Rigid Body only. Turn on **Collider Tool** and drag across the viewer to draw
-something for the pieces to hit. Each drag adds one line; chain several together
-to make a ramp, a funnel, a shelf, or a wall at an angle. Endpoints are
-draggable, and **Clear Obstacles** removes them all.
+Rigid Body only. Turn on **Collider Tool**, pick a shape from **Draw**, and drag
+across the viewer. Each drag adds one obstacle.
 
-An obstacle is solid from **both sides** — the contact normal is oriented toward
-whichever side the piece approached from each substep, so the same line can be
-landed on from above and bounced off from below without being two objects. It
-also **ends where you stopped drawing**: a piece sliding off the end of a ramp
-keeps going rather than catching on an invisible extension. Obstacles are stored
-in the **Obstacles** field in the same format as cuts, and there is a cap of 32
-because every one of them is tested against every moving piece every substep.
+| Draw | One drag gives you |
+|---|---|
+| Box | opposite corners of an axis-aligned box |
+| Circle | centre, then a point on the rim |
+| Line | the two ends |
 
-Moving an obstacle rebuilds the cached simulation, the same as any other physics
-change.
+Existing obstacles keep whatever they were drawn as, so a scene can mix all
+three. Every shape is stored as just **two control points**, which is what lets
+one pair of drag handles edit all of them. **Clear Obstacles** removes the lot.
+
+**Box and Circle are solid all the way through** — they are real convex bodies,
+not outlines. Four lines around a box would leave an interior that anything
+already inside simply stays in. A **Line** is a bare edge, which is what you want
+for a ramp or a shelf.
+
+An obstacle is solid from **both sides** — for a line the contact normal is
+oriented toward whichever side the piece approached from, each substep, so the
+same line can be landed on from above and bounced off from below without being
+two objects. A line also **ends where you stopped drawing**: a piece sliding off
+the end of a ramp keeps going rather than catching on an invisible extension.
+
+Note that a circle sheds what lands off its centre — pieces slide down the sides
+and away. That is correct, not a bug, and it is why the test suite checks that
+nothing ever gets *inside* a circle rather than that anything comes to rest on
+one.
+
+Obstacles live in the **Obstacles** field as `shape,x1,y1,x2,y2` (0 = line,
+1 = box, 2 = circle), capped at 32 because every one is tested against every
+moving piece every substep. Changing any of it — including the shape alone —
+rebuilds the cached simulation.
 
 ### Render
 
@@ -429,6 +447,21 @@ letter also slices whatever else lies along that line. Barriers cost a fill pass
 and are worth it. The barrier radius is 0.75 px rather than 0.5 because an
 eight-connected labeller steps diagonally: a thinner diagonal cut leaks, and it
 leaks as a function of the angle, which is the worst kind of intermittent.
+
+**Static convex obstacles go through the same `addPolyContacts` as shard-shard
+collisions.** A box gets real reference-face clipping rather than an
+approximation nobody remembers is there. The winding must give a POSITIVE
+shoelace area, because outward normals are derived from it — reversed, every
+normal points into the box and pieces fall straight through. Check that against
+`PolygonArea` rather than by eye: core coordinates are top-down, so
+"counter-clockwise" reads backwards on screen, and this was written the wrong way
+round the first time.
+
+**Anything added to `Collider` must also be added to `HashSimParams` and to the
+copy loop in `World::reset`.** Both were missed when the shape field went in.
+Forgetting the hash means changing a shape silently keeps the old simulation;
+forgetting the copy means every obstacle becomes whatever the struct's default
+is. Neither produces an error, and both look like a physics bug.
 
 **A drawn obstacle picks its normal from which side the piece is on, every
 substep.** That is what makes one line solid from both directions. The

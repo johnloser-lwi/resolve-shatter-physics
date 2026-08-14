@@ -106,7 +106,15 @@ constexpr const char* kParamSubsteps          = "substeps";
 // the ballistic mode has no collisions of any kind to hook them into.
 constexpr const char* kParamColliders        = "colliders";
 constexpr const char* kParamColliderTool     = "colliderTool";
+constexpr const char* kParamColliderShape    = "colliderShape";
 constexpr const char* kParamClearColliders   = "clearColliders";
+
+// What the NEXT obstacle you draw will be. Existing ones keep their own shape.
+enum ColliderShapeIndex {
+  kColliderLine   = 0,
+  kColliderRect   = 1,
+  kColliderCircle = 2,
+};
 
 enum SimModeIndex {
   kSimBallistic = 0,   // closed form, evaluated at any t, no collisions

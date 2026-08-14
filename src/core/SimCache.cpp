@@ -44,6 +44,11 @@ uint64_t HashSimParams(const ForceParams& fp, const PhysicsParams& pp,
   // the set of positions happens to be the same afterwards.
   mix(h, uint64_t(colliders.size()));
   for (const Collider& c : colliders) {
+    // The shape belongs here as much as the coordinates do. It is the one field
+    // that is not a number on screen, which makes it the one a hash is likeliest
+    // to be written without -- and the same two points mean something entirely
+    // different as a box than as a line.
+    mix(h, uint64_t(c.shape));
     mixF(h, c.x1);
     mixF(h, c.y1);
     mixF(h, c.x2);

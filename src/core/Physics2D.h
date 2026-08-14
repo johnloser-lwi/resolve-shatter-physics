@@ -28,24 +28,36 @@
 
 namespace shp {
 
+enum class ColliderShape {
+  Line   = 0,  ///< a bare segment: a ramp, a shelf, a wall at an angle
+  Rect   = 1,  ///< axis-aligned box, solid throughout
+  Circle = 2,  ///< solid disc
+};
+
 /** @brief A static obstacle drawn by hand, in normalized [0,1] coordinates.
  *
- * A line segment, deliberately: it is the same gesture as a slice, it is trivial
- * to draw accurately, and a chain of them makes any shape worth having -- a
- * ramp, a funnel, a shelf, a wall at an angle. Filled polygons would need
- * winding rules and inside/outside tests to buy very little a chain of segments
- * cannot already do.
+ * Every shape is stored as exactly two control points, which is what lets one
+ * pair of drag handles edit all three:
+ *
+ *   Line    p1 and p2 are the ends
+ *   Rect    p1 and p2 are opposite corners
+ *   Circle  p1 is the centre, p2 is a point on the rim
+ *
+ * A rect is a real convex body rather than four separate lines, so a piece
+ * cannot end up inside it -- four lines leave an interior that anything already
+ * within simply stays in.
  *
  * Deliberately NOT part of PhysicsParams. That struct is passed by reference to
  * functions marked SHP_HD, and giving it a std::vector member would make a
  * device-compiled header depend on host-only types.
  */
 struct Collider {
+  ColliderShape shape = ColliderShape::Rect;
   float x1 = 0.0f, y1 = 0.0f;
   float x2 = 0.0f, y2 = 0.0f;
 
   bool operator==(const Collider& o) const {
-    return x1 == o.x1 && y1 == o.y1 && x2 == o.x2 && y2 == o.y2;
+    return shape == o.shape && x1 == o.x1 && y1 == o.y1 && x2 == o.x2 && y2 == o.y2;
   }
 };
 
@@ -136,6 +148,13 @@ class World {
   void collectShardContacts();
   void collectStaticContacts();
   void collectColliderContacts();
+
+  /// Convex-vs-convex contacts, appended to _contacts. @p ib may be -1 for a
+  /// static obstacle. Shared by shard-shard and shard-rectangle, so both get the
+  /// same reference-face clipping rather than one of them getting an
+  /// approximation nobody remembers is there.
+  void addPolyContacts(int ia, int ib, const std::vector<Vec2>& hullA,
+                       const std::vector<Vec2>& hullB);
 
   struct Contact {
     int a = -1;          ///< body index; b < 0 means a static plane

@@ -185,6 +185,7 @@ class ShatterPhysicsPlugin : public OFX::ImageEffect {
     _substeps = fetchIntParam(shp::kParamSubsteps);
     _colliders = fetchStringParam(shp::kParamColliders);
     _colliderTool = fetchBooleanParam(shp::kParamColliderTool);
+    _colliderShape = fetchChoiceParam(shp::kParamColliderShape);
 
     _startFrame = fetchIntParam(shp::kParamStartFrame);
     _seed = fetchIntParam(shp::kParamSeed);
@@ -281,6 +282,7 @@ class ShatterPhysicsPlugin : public OFX::ImageEffect {
   OFX::IntParam* _substeps = nullptr;
   OFX::StringParam* _colliders = nullptr;
   OFX::BooleanParam* _colliderTool = nullptr;
+  OFX::ChoiceParam* _colliderShape = nullptr;
 
   OFX::IntParam* _startFrame = nullptr;
   OFX::IntParam* _seed = nullptr;
@@ -429,7 +431,7 @@ shp::PhysicsParams ShatterPhysicsPlugin::readPhysics(double t) const {
 std::vector<shp::Collider> ShatterPhysicsPlugin::readColliders(double t) const {
   std::string s;
   _colliders->getValueAtTime(t, s);
-  return shp::ParseSegments<shp::Collider>(s, shp::kMaxColliders);
+  return shp::ParseColliders(s);
 }
 
 shp::RenderParams ShatterPhysicsPlugin::readRender(double t) const {
@@ -490,6 +492,7 @@ void ShatterPhysicsPlugin::syncVisibility() {
   // tool that draws lines nothing ever hits.
   _colliderTool->setIsSecret(!rigid);
   _colliders->setIsSecret(!rigid);
+  _colliderShape->setIsSecret(!rigid);
 
   // The fade sub-controls mean nothing while the fade is switched off.
   double dur = 0.0;
@@ -1328,6 +1331,25 @@ void ShatterPhysicsFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
         "drawing -- a piece sliding off the end of a ramp keeps going.");
     p->setDefault(false);
     addParamUI(page, p, gPhys);  // a viewer mode, not a value the render reads
+  }
+  {
+    OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam(shp::kParamColliderShape);
+    p->setLabels("  Draw", "Draw", "Obstacle Shape");
+    p->setHint(
+        "What the next obstacle you draw will be. Existing ones keep whatever "
+        "they were drawn as, so a scene can mix all three.\n\n"
+        "Box and Circle are solid all the way through -- nothing gets inside "
+        "one. A Line is a bare edge, which is what you want for a ramp or a "
+        "shelf.");
+    // Option order matches ColliderShape exactly, so the stored index IS the
+    // enum value. A prettier menu order would need a mapping table, and a
+    // mapping table between two lists that both look like the truth is how an
+    // off-by-one gets written down and believed.
+    p->appendOption("Line");
+    p->appendOption("Box");
+    p->appendOption("Circle");
+    p->setDefault(shp::kColliderRect);
+    addParamUI(page, p, gPhys);  // affects the next drag, not the render
   }
   {
     OFX::StringParamDescriptor* p = desc.defineStringParam(shp::kParamColliders);

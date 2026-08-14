@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "core/Cells.h"
+#include "core/Physics2D.h"
 
 namespace shp {
 
@@ -96,6 +97,61 @@ inline std::vector<Slice> ParseSlices(const std::string& in) {
 
 inline std::string FormatSlices(const std::vector<Slice>& slices) {
   return FormatSegments(slices);
+}
+
+// Obstacles carry a shape, so their records are five numbers rather than four
+// and they need their own pair. A shared parser reading a variable field count
+// would be the kind of cleverness that turns a half-typed field into a silently
+// misread one.
+inline std::vector<Collider> ParseColliders(const std::string& in) {
+  std::vector<Collider> out;
+
+  float v[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  int have = 0;
+  std::size_t i = 0;
+
+  while (i <= in.size() && int(out.size()) < kMaxColliders) {
+    while (i < in.size() && in[i] != '-' && in[i] != '+' && in[i] != '.' &&
+           !(in[i] >= '0' && in[i] <= '9'))
+      ++i;
+    if (i >= in.size()) break;
+
+    char* end = nullptr;
+    const float f = std::strtof(in.c_str() + i, &end);
+    if (end == in.c_str() + i) {
+      ++i;
+      continue;
+    }
+    i = std::size_t(end - in.c_str());
+
+    v[have++] = f;
+    if (have == 5) {
+      Collider c;
+      const int shape = int(v[0]);
+      // Clamped rather than rejected: a file from a future version with a shape
+      // this build does not know should still place an obstacle, not drop it.
+      c.shape = ColliderShape(shape < 0 ? 0 : (shape > 2 ? 2 : shape));
+      c.x1 = v[1];
+      c.y1 = v[2];
+      c.x2 = v[3];
+      c.y2 = v[4];
+      out.push_back(c);
+      have = 0;
+    }
+  }
+  return out;
+}
+
+inline std::string FormatColliders(const std::vector<Collider>& colliders) {
+  std::string out;
+  char buf[112];
+  for (std::size_t i = 0; i < colliders.size(); ++i) {
+    const Collider& c = colliders[i];
+    std::snprintf(buf, sizeof(buf), "%s%d,%.4f,%.4f,%.4f,%.4f", i ? "; " : "", int(c.shape),
+                  c.x1, c.y1, c.x2, c.y2);
+    out += buf;
+  }
+  return out;
 }
 
 }  // namespace shp

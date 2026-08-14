@@ -273,8 +273,11 @@ int main(int argc, char** argv) {
       shp::Slice sl;
       if (parseSlice(argv[++i], sl)) sp.slices.push_back(sl);
     }
-    else if (a == "--collider" && i + 1 < argc) {
+    else if ((a == "--collider" || a == "--box" || a == "--circle") && i + 1 < argc) {
       shp::Collider co;
+      co.shape = a == "--box"      ? shp::ColliderShape::Rect
+                 : a == "--circle" ? shp::ColliderShape::Circle
+                                   : shp::ColliderShape::Line;
       if (std::sscanf(argv[++i], "%f,%f,%f,%f", &co.x1, &co.y1, &co.x2, &co.y2) == 4)
         colliders.push_back(co);
     }

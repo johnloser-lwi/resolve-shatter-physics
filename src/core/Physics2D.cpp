@@ -125,6 +125,7 @@ void World::reset(const std::vector<Shard>& shards, const ForceParams& fp,
   _colliders.reserve(colliders.size());
   for (const Collider& c : colliders) {
     Collider p;
+    p.shape = c.shape;
     p.x1 = c.x1 * fs.width;
     p.y1 = c.y1 * fs.height;
     p.x2 = c.x2 * fs.width;
@@ -314,6 +315,101 @@ void World::collectStaticContacts() {
   }
 }
 
+void World::addPolyContacts(int ia, int ib, const std::vector<Vec2>& hullA,
+                            const std::vector<Vec2>& hullB) {
+  int edgeA = 0, edgeB = 0;
+  const float sepA = maxSeparation(hullA, hullB, edgeA);
+  if (sepA > 0.0f) return;
+  const float sepB = maxSeparation(hullB, hullA, edgeB);
+  if (sepB > 0.0f) return;
+
+  // The reference face is the one with the LEAST penetration. Using the other
+  // one puts contact points on the wrong side, and bodies stick together
+  // instead of pushing apart.
+  const bool useA = sepA >= sepB;
+  const std::vector<Vec2>& ref = useA ? hullA : hullB;
+  const std::vector<Vec2>& inc = useA ? hullB : hullA;
+  const int refEdge = useA ? edgeA : edgeB;
+
+  const std::size_t rn = ref.size();
+  const Vec2 r1 = ref[std::size_t(refEdge)];
+  const Vec2 r2 = ref[(std::size_t(refEdge) + 1) % rn];
+  const Vec2 refDir = Normalize(r2 - r1);
+  if (refDir.x == 0.0f && refDir.y == 0.0f) return;
+  const Vec2 refNormal(refDir.y, -refDir.x);
+
+  // Incident edge: the one on the other body most anti-parallel to the
+  // reference normal.
+  std::size_t incEdge = 0;
+  float minDot = 1e30f;
+  const std::size_t in = inc.size();
+  for (std::size_t e = 0; e < in; ++e) {
+    const Vec2 ev = inc[(e + 1) % in] - inc[e];
+    const Vec2 en = Normalize(Vec2(ev.y, -ev.x));
+    const float dt = Dot(en, refNormal);
+    if (dt < minDot) {
+      minDot = dt;
+      incEdge = e;
+    }
+  }
+
+  Vec2 seg[2] = {inc[incEdge], inc[(incEdge + 1) % in]};
+  Vec2 clipped[2];
+  if (clipSegment(seg, -refDir, Dot(-refDir, r1), clipped) < 2) return;
+  seg[0] = clipped[0];
+  seg[1] = clipped[1];
+  if (clipSegment(seg, refDir, Dot(refDir, r2), clipped) < 2) return;
+
+  const float refOffset = Dot(refNormal, r1);
+  for (int p = 0; p < 2; ++p) {
+    const float sep = Dot(refNormal, clipped[p]) - refOffset;
+    if (sep > 0.0f) continue;
+
+    Contact c;
+    c.a = ia;
+    c.b = ib;
+    // Always from A toward B, whichever body owned the reference face.
+    c.normal = useA ? refNormal : -refNormal;
+    c.point = clipped[p];
+    c.depth = -sep;
+    _contacts.push_back(c);
+  }
+}
+
+namespace {
+
+/// Closest point on a convex polygon's boundary to @p p, and whether p is inside.
+Vec2 closestOnPolygon(const std::vector<Vec2>& poly, const Vec2& p, bool& inside) {
+  inside = true;
+  Vec2 best = poly[0];
+  float bestD2 = 1e30f;
+
+  const std::size_t n = poly.size();
+  for (std::size_t i = 0, j = n - 1; i < n; j = i++) {
+    const Vec2& a = poly[j];
+    const Vec2& b = poly[i];
+    const Vec2 ab = b - a;
+
+    // Outward normal for the winding ConvexHull produces; a positive dot means
+    // p is beyond this edge and therefore outside.
+    const Vec2 nrm(ab.y, -ab.x);
+    if (Dot(p - a, nrm) > 0.0f) inside = false;
+
+    const float len2 = LengthSq(ab);
+    float t = len2 > 1e-12f ? Dot(p - a, ab) / len2 : 0.0f;
+    t = Clamp01(t);
+    const Vec2 q = a + ab * t;
+    const float d2 = LengthSq(p - q);
+    if (d2 < bestD2) {
+      bestD2 = d2;
+      best = q;
+    }
+  }
+  return best;
+}
+
+}  // namespace
+
 void World::collectColliderContacts() {
   if (_colliders.empty()) return;
 
@@ -329,14 +425,84 @@ void World::collectColliderContacts() {
     transformHull(b, _worldVerts);
     const Vec2 centre = b.worldPos();
 
+    std::vector<Vec2> box;
+
     for (const Collider& c : _colliders) {
       const Vec2 a(c.x1, c.y1);
       const Vec2 e(c.x2, c.y2);
+
+      if (c.shape == ColliderShape::Rect) {
+        const float lo_x = std::min(a.x, e.x), hi_x = std::max(a.x, e.x);
+        const float lo_y = std::min(a.y, e.y), hi_y = std::max(a.y, e.y);
+        if (hi_x - lo_x < 1.0f || hi_y - lo_y < 1.0f) continue;
+
+        // Cheap reject on the bounding circle before the SAT.
+        const Vec2 mid((lo_x + hi_x) * 0.5f, (lo_y + hi_y) * 0.5f);
+        const float half = Length(Vec2(hi_x - mid.x, hi_y - mid.y));
+        if (LengthSq(centre - mid) > (b.radius + half) * (b.radius + half)) continue;
+
+        // Wound so the shoelace area is POSITIVE, matching ConvexHull's output,
+        // because addPolyContacts derives outward normals from the winding.
+        // Reversed, every normal points into the box and pieces fall straight
+        // through it. Worth checking against PolygonArea rather than by eye --
+        // top-down y makes "counter-clockwise" read backwards on screen, and
+        // this was written the wrong way round the first time.
+        box.clear();
+        box.push_back(Vec2(lo_x, lo_y));
+        box.push_back(Vec2(hi_x, lo_y));
+        box.push_back(Vec2(hi_x, hi_y));
+        box.push_back(Vec2(lo_x, hi_y));
+        addPolyContacts(int(i), -1, _worldVerts, box);
+        continue;
+      }
+
+      if (c.shape == ColliderShape::Circle) {
+        const float radius = Length(e - a);
+        if (radius < 1.0f) continue;
+        if (LengthSq(centre - a) > (b.radius + radius) * (b.radius + radius)) continue;
+
+        // Closest point on the shard to the circle's centre. For a disc that is
+        // all the contact needs: the normal is radial, so there is no reference
+        // face to choose and no clipping to do.
+        bool insideShard = false;
+        const Vec2 q = closestOnPolygon(_worldVerts, a, insideShard);
+
+        Vec2 dir = q - a;
+        float dist = Length(dir);
+        float depth;
+        if (insideShard) {
+          // The disc's centre is within the piece -- a small obstacle under a
+          // big shard. Push the shard until the disc is clear of it entirely.
+          depth = radius + dist;
+        } else {
+          if (dist >= radius) continue;
+          depth = radius - dist;
+        }
+
+        if (dist < 1e-4f) {
+          // Concentric: no radial direction exists. Push straight up rather
+          // than dividing by zero and handing the solver a NaN it will spread
+          // to every body it touches.
+          dir = Vec2(0.0f, -1.0f);
+        } else {
+          dir = dir * (1.0f / dist);
+        }
+
+        Contact ct;
+        ct.a = int(i);
+        ct.b = -1;
+        ct.normal = -dir;  // from A toward the obstacle, as the solver expects
+        ct.point = q;
+        ct.depth = depth;
+        _contacts.push_back(ct);
+        continue;
+      }
+
+      // Line.
       const Vec2 ab = e - a;
       const float len2 = LengthSq(ab);
       if (len2 < 1.0f) continue;  // a click, not a line
 
-      // Cheap reject: the whole body is further from the line than it is wide.
       Vec2 n = Normalize(Vec2(ab.y, -ab.x));
       if (n.x == 0.0f && n.y == 0.0f) continue;
 
@@ -475,64 +641,7 @@ void World::collectShardContacts() {
 
           transformHull(A, hullA);
           transformHull(B, hullB);
-
-          int edgeA = 0, edgeB = 0;
-          const float sepA = maxSeparation(hullA, hullB, edgeA);
-          if (sepA > 0.0f) continue;
-          const float sepB = maxSeparation(hullB, hullA, edgeB);
-          if (sepB > 0.0f) continue;
-
-          // The reference face is the one with the LEAST penetration. Using the
-          // other one puts contact points on the wrong side, and pieces stick
-          // together instead of pushing apart.
-          const bool useA = sepA >= sepB;
-          const std::vector<Vec2>& ref = useA ? hullA : hullB;
-          const std::vector<Vec2>& inc = useA ? hullB : hullA;
-          const int refEdge = useA ? edgeA : edgeB;
-
-          const std::size_t rn = ref.size();
-          const Vec2 r1 = ref[std::size_t(refEdge)];
-          const Vec2 r2 = ref[(std::size_t(refEdge) + 1) % rn];
-          const Vec2 refDir = Normalize(r2 - r1);
-          if (refDir.x == 0.0f && refDir.y == 0.0f) continue;
-          const Vec2 refNormal(refDir.y, -refDir.x);
-
-          // Incident edge: the one on the other body most anti-parallel to the
-          // reference normal.
-          std::size_t incEdge = 0;
-          float minDot = 1e30f;
-          const std::size_t in = inc.size();
-          for (std::size_t e = 0; e < in; ++e) {
-            const Vec2 ev = inc[(e + 1) % in] - inc[e];
-            const Vec2 en = Normalize(Vec2(ev.y, -ev.x));
-            const float dt = Dot(en, refNormal);
-            if (dt < minDot) {
-              minDot = dt;
-              incEdge = e;
-            }
-          }
-
-          Vec2 seg[2] = {inc[incEdge], inc[(incEdge + 1) % in]};
-          Vec2 clipped[2];
-          if (clipSegment(seg, -refDir, Dot(-refDir, r1), clipped) < 2) continue;
-          seg[0] = clipped[0];
-          seg[1] = clipped[1];
-          if (clipSegment(seg, refDir, Dot(refDir, r2), clipped) < 2) continue;
-
-          const float refOffset = Dot(refNormal, r1);
-          for (int p = 0; p < 2; ++p) {
-            const float sep = Dot(refNormal, clipped[p]) - refOffset;
-            if (sep > 0.0f) continue;
-
-            Contact c;
-            c.a = int(ia);
-            c.b = ib;
-            // Always from A toward B, whichever body owned the reference face.
-            c.normal = useA ? refNormal : -refNormal;
-            c.point = clipped[p];
-            c.depth = -sep;
-            _contacts.push_back(c);
-          }
+          addPolyContacts(int(ia), ib, hullA, hullB);
         }
       }
     }

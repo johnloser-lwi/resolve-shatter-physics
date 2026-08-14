@@ -27,6 +27,10 @@ int g_failures = 0;
 /// says so at the call site rather than leaving a bare `{}` to be puzzled over.
 const std::vector<shp::Collider> noColliders;
 
+struct Vec2Like {
+  float x, y;
+};
+
 void check(bool ok, const char* what) {
   if (!ok) {
     std::printf("FAIL: %s\n", what);
@@ -534,7 +538,11 @@ void testColliders() {
   check(belowFrame == int(fell.size()), "with no obstacle everything falls out of frame");
 
   // A shelf right across the frame, below the discs, must catch all of them.
+  // The shape is set explicitly: the struct default is Box, and a zero-height
+  // box is degenerate and correctly ignored, which would make this test pass
+  // for entirely the wrong reason.
   std::vector<shp::Collider> shelf(1);
+  shelf[0].shape = shp::ColliderShape::Line;
   shelf[0].x1 = 0.0f;
   shelf[0].y1 = 0.95f;
   shelf[0].x2 = 1.0f;
@@ -557,6 +565,7 @@ void testColliders() {
   // A stub off to one side must catch nothing -- an obstacle ends where it was
   // drawn, and does not secretly extend across the frame.
   std::vector<shp::Collider> stub(1);
+  stub[0].shape = shp::ColliderShape::Line;
   stub[0].x1 = 0.90f;
   stub[0].y1 = 0.95f;
   stub[0].x2 = 1.00f;
@@ -575,6 +584,7 @@ void testColliders() {
   shp::PhysicsParams up = pp;
   up.gravity = -6.0f;  // negative gravity, so "down" is up the screen
   std::vector<shp::Collider> ceiling(1);
+  ceiling[0].shape = shp::ColliderShape::Line;
   ceiling[0].x1 = 0.0f;
   ceiling[0].y1 = 0.02f;
   ceiling[0].x2 = 1.0f;
@@ -595,6 +605,93 @@ void testColliders() {
   moved[0].y1 = moved[0].y2 = 0.60f;
   check(a != shp::HashSimParams(fp, pp, moved), "moving an obstacle rebuilds the simulation");
   check(a != shp::HashSimParams(fp, pp, noColliders), "removing an obstacle rebuilds it too");
+
+  // Changing only the SHAPE has to rebuild too. It is the one field that is not
+  // a coordinate, so it is the one a hash is most likely to forget.
+  std::vector<shp::Collider> asBox = shelf;
+  asBox[0].shape = shp::ColliderShape::Rect;
+  check(a != shp::HashSimParams(fp, pp, asBox), "changing an obstacle's shape rebuilds it");
+}
+
+// A box and a circle are solid all the way through. Four lines around a box
+// would leave an interior that anything already inside simply stays in, which is
+// the whole reason these are real convex bodies.
+void testColliderShapes() {
+  const TestImage img = makeDiscs();
+  shp::ShapeParams sp;
+  sp.pattern = shp::Pattern::Alpha;
+  sp.buildPolygons = true;
+  auto geom = shp::buildGeometry(img.view(), nullptr, sp);
+  const shp::FrameScale fs = scaleOf(*geom);
+
+  shp::ForceParams fp;
+  fp.f1.enabled = true;
+  fp.f1.strength = 0.0f;
+  shp::PhysicsParams pp;
+  pp.gravity = 6.0f;
+  pp.floorEnabled = false;
+  pp.bounciness = 0.0f;
+  pp.collideShards = false;
+  shp::RenderParams rp;
+
+  // A box spanning the frame, entirely BELOW the lowest disc. The biggest disc
+  // reaches y = 184 of 200, so anything higher than that would start already
+  // overlapping and the test would be measuring the solver pushing it out
+  // rather than it landing.
+  std::vector<shp::Collider> box(1);
+  box[0].shape = shp::ColliderShape::Rect;
+  box[0].x1 = 0.0f;
+  box[0].y1 = 0.95f;
+  box[0].x2 = 1.0f;
+  box[0].y2 = 1.25f;   // extends past the bottom edge, so it is a solid slab
+
+  shp::SimCache boxSim;
+  std::vector<shp::ShardPose> onBox;
+  boxSim.getPoses(geom, fp, pp, rp, fs, box, 120.0f, onBox);
+
+  const float boxTop = 0.95f * fs.height;
+  int aboveBox = 0;
+  bool boxSettled = true;
+  for (std::size_t i = 0; i < onBox.size(); ++i) {
+    // A piece resting on the top face has its centroid ABOVE that face. One
+    // that sank inside would have its centroid below it.
+    if (geom->shards[i].cy + onBox[i].y < boxTop + 10.0f) ++aboveBox;
+    if (std::fabs(onBox[i].vy) > 2.0f) boxSettled = false;
+  }
+  check(aboveBox == int(onBox.size()), "a box catches pieces and none end up inside it");
+  check(boxSettled, "pieces come to rest on a box");
+
+  // A circle whose rim sits just below the discs, centred well off the bottom.
+  const float cxN = 0.5f, cyN = 2.0f, rimN = 0.95f;
+  std::vector<shp::Collider> disc(1);
+  disc[0].shape = shp::ColliderShape::Circle;
+  disc[0].x1 = cxN;
+  disc[0].y1 = cyN;
+  disc[0].x2 = cxN;
+  disc[0].y2 = rimN;
+
+  const Vec2Like centre{cxN * fs.width, cyN * fs.height};
+  const float radius = (cyN - rimN) * fs.height;
+
+  // Sampled across the whole fall rather than only at the end, and deliberately
+  // NOT asserting that anything settles. A curved surface sheds what lands off
+  // its centre -- pieces sliding down the sides and away is correct behaviour,
+  // not a failure, so solidity is the only thing worth checking here.
+  shp::SimCache discSim;
+  std::vector<shp::ShardPose> onDisc;
+  int penetrations = 0;
+  for (int frame = 10; frame <= 120; frame += 10) {
+    discSim.getPoses(geom, fp, pp, rp, fs, disc, float(frame), onDisc);
+    for (std::size_t i = 0; i < onDisc.size(); ++i) {
+      const float cx = geom->shards[i].cx + onDisc[i].x;
+      const float cy = geom->shards[i].cy + onDisc[i].y;
+      const float dx = cx - centre.x, dy = cy - centre.y;
+      // A piece resting on or sliding along the rim keeps its centroid outside
+      // it; one that sank in would be measurably closer to the centre.
+      if (std::sqrt(dx * dx + dy * dy) < radius - 10.0f) ++penetrations;
+    }
+  }
+  check(penetrations == 0, "nothing ever gets inside a circle");
 }
 
 // Changing a render-only control must NOT invalidate the simulation, or every
@@ -857,6 +954,7 @@ int main() {
   testManualSlices();
   testSliceListRoundTrip();
   testColliders();
+  testColliderShapes();
   testFadeDoesNotInvalidateSim();
   testPiecesRestOnFloor();
   testRestFrameReproducesSource();

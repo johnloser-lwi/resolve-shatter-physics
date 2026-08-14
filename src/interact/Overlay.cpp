@@ -189,6 +189,7 @@ class ForceInteract : public OFX::OverlayInteract {
       addParamToSlaveTo(_effect->fetchBooleanParam(kParamSliceTool));
       addParamToSlaveTo(_effect->fetchStringParam(kParamColliders));
       addParamToSlaveTo(_effect->fetchBooleanParam(kParamColliderTool));
+      addParamToSlaveTo(_effect->fetchChoiceParam(kParamColliderShape));
     } catch (...) {
     }
   }
@@ -221,7 +222,7 @@ class ForceInteract : public OFX::OverlayInteract {
       const bool colliders = pass == 0;
       if (!toolOn(args.time, colliders)) continue;
 
-      const std::vector<Slice> segs = readList(args.time, colliders);
+      const std::vector<Entry> segs = readList(args.time, colliders);
       for (std::size_t i = 0; i < segs.size(); ++i) {
         for (int e = 0; e < 2; ++e) {
           const OfxPointD p = c.toCanonical(e == 0 ? segs[i].x1 : segs[i].x2,
@@ -245,6 +246,11 @@ class ForceInteract : public OFX::OverlayInteract {
 
       double nx = 0.0, ny = 0.0;
       c.toNormalized(args.penPosition, nx, ny);
+      _pending = Entry{};
+      // A cut is always a line; an obstacle is whatever the Draw menu says. The
+      // shape is captured now, at the start of the drag, so changing the menu
+      // mid-drag cannot turn a half-drawn box into a circle.
+      _pending.shape = colliders ? pendingShape(args.time) : ColliderShape::Line;
       _pending.x1 = _pending.x2 = float(nx);
       _pending.y1 = _pending.y2 = float(ny);
       _onColliders = colliders;
@@ -306,7 +312,7 @@ class ForceInteract : public OFX::OverlayInteract {
     }
     if (_grab == Grab::SegEnd) {
       try {
-        std::vector<Slice> segs = readList(args.time, _onColliders);
+        std::vector<Entry> segs = readList(args.time, _onColliders);
         if (_segIndex >= 0 && _segIndex < int(segs.size())) {
           double nx = 0.0, ny = 0.0;
           c.toNormalized(args.penPosition, nx, ny);
@@ -383,7 +389,7 @@ class ForceInteract : public OFX::OverlayInteract {
       const double dy = double(_pending.y2 - _pending.y1) * (haveCtx ? c.height() : 1.0);
       if (dx * dx + dy * dy >= 9.0) {
         try {
-          std::vector<Slice> segs = readList(args.time, _onColliders);
+          std::vector<Entry> segs = readList(args.time, _onColliders);
           if (int(segs.size()) < (_onColliders ? kMaxColliders : kMaxSlices)) {
             segs.push_back(_pending);
             writeList(segs, _onColliders);
@@ -450,58 +456,118 @@ class ForceInteract : public OFX::OverlayInteract {
     return on;
   }
 
-  std::vector<Slice> readList(double t, bool colliders) const {
+  // Both lists are read into the same shape here -- two control points plus a
+  // shape tag -- which is what lets one set of drag handles edit all of them.
+  // For a cut the tag is always Line and is ignored.
+  struct Entry {
+    ColliderShape shape = ColliderShape::Line;
+    float x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+  };
+
+  std::vector<Entry> readList(double t, bool colliders) const {
     std::string s;
     try {
       _effect->fetchStringParam(listFor(colliders).param)->getValueAtTime(t, s);
     } catch (...) {
     }
-    return ParseSegments<Slice>(s, colliders ? kMaxColliders : kMaxSlices);
+
+    std::vector<Entry> out;
+    if (colliders) {
+      for (const Collider& c : ParseColliders(s))
+        out.push_back(Entry{c.shape, c.x1, c.y1, c.x2, c.y2});
+    } else {
+      for (const Slice& c : ParseSegments<Slice>(s, kMaxSlices))
+        out.push_back(Entry{ColliderShape::Line, c.x1, c.y1, c.x2, c.y2});
+    }
+    return out;
   }
 
-  void writeList(const std::vector<Slice>& segs, bool colliders) const {
-    _effect->fetchStringParam(listFor(colliders).param)->setValue(FormatSegments(segs));
+  void writeList(const std::vector<Entry>& segs, bool colliders) const {
+    std::string text;
+    if (colliders) {
+      std::vector<Collider> cs;
+      for (const Entry& e : segs) {
+        Collider c;
+        c.shape = e.shape;
+        c.x1 = e.x1;
+        c.y1 = e.y1;
+        c.x2 = e.x2;
+        c.y2 = e.y2;
+        cs.push_back(c);
+      }
+      text = FormatColliders(cs);
+    } else {
+      std::vector<Slice> ss;
+      for (const Entry& e : segs) {
+        Slice c;
+        c.x1 = e.x1;
+        c.y1 = e.y1;
+        c.x2 = e.x2;
+        c.y2 = e.y2;
+        ss.push_back(c);
+      }
+      text = FormatSlices(ss);
+    }
+    _effect->fetchStringParam(listFor(colliders).param)->setValue(text);
   }
 
-  void drawList(const Ctx& c, double t, bool colliders) {
-    const std::vector<Slice> segs = readList(t, colliders);
-    const bool tool = toolOn(t, colliders);
-    const SegmentList def = listFor(colliders);
+  ColliderShape pendingShape(double t) const {
+    int v = 0;
+    try {
+      _effect->fetchChoiceParam(kParamColliderShape)->getValueAtTime(t, v);
+    } catch (...) {
+    }
+    return ColliderShape(v < 0 ? 0 : (v > 2 ? 2 : v));
+  }
 
-    for (std::size_t i = 0; i < segs.size(); ++i) {
-      const OfxPointD a = c.toCanonical(segs[i].x1, segs[i].y1);
-      const OfxPointD b = c.toCanonical(segs[i].x2, segs[i].y2);
+  // One entry drawn, whatever it is.
+  void drawEntry(const Ctx& c, const Entry& e, const Colour& col, bool handles) {
+    const OfxPointD a = c.toCanonical(e.x1, e.y1);
+    const OfxPointD b = c.toCanonical(e.x2, e.y2);
 
-      // Drawn dark-then-light so a line stays readable over both bright and dark
-      // footage, which matters more here than anywhere else on the overlay -- a
-      // cut you cannot see is a cut you cannot fix.
-      setColour(c, kShadow);
-      c.draw->setLineWidth(c.ctx, 3.0f);
-      line(c, a.x, a.y, b.x, b.y);
-      setColour(c, def.colour);
-      c.draw->setLineWidth(c.ctx, 1.0f);
-      line(c, a.x, a.y, b.x, b.y);
+    // Dark pass then light, so a line stays readable over both bright and dark
+    // footage -- an obstacle you cannot see is one you cannot move.
+    for (int pass = 0; pass < 2; ++pass) {
+      setColour(c, pass == 0 ? kShadow : col);
+      c.draw->setLineWidth(c.ctx, pass == 0 ? 3.0f : 1.0f);
 
-      // Endpoint handles only while the matching tool is armed. Left on
-      // permanently they would clutter the viewer for anyone who has finished
-      // drawing and is now tuning the physics.
-      if (tool) {
-        handle(c, a.x, a.y, def.colour, 4.0);
-        handle(c, b.x, b.y, def.colour, 4.0);
+      switch (e.shape) {
+        case ColliderShape::Rect: {
+          const OfxPointD p[4] = {{a.x, a.y}, {b.x, a.y}, {b.x, b.y}, {a.x, b.y}};
+          c.draw->draw(c.ctx, kOfxDrawPrimitiveLineLoop, p, 4);
+          break;
+        }
+        case ColliderShape::Circle: {
+          const double r = std::sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y));
+          ellipse(c, a.x, a.y, r, r);
+          break;
+        }
+        case ColliderShape::Line:
+        default:
+          line(c, a.x, a.y, b.x, b.y);
+          break;
       }
     }
 
-    // The line currently being dragged, in a different colour so it is obviously
-    // not committed yet.
+    if (!handles) return;
+    handle(c, a.x, a.y, col, 4.0);
+    handle(c, b.x, b.y, col, 4.0);
+  }
+
+  void drawList(const Ctx& c, double t, bool colliders) {
+    const std::vector<Entry> segs = readList(t, colliders);
+    const bool tool = toolOn(t, colliders);
+    const SegmentList def = listFor(colliders);
+
+    // Handles only while the matching tool is armed. Left on permanently they
+    // would clutter the viewer for anyone who has finished drawing and is now
+    // tuning the physics.
+    for (const Entry& e : segs) drawEntry(c, e, def.colour, tool);
+
+    // Whatever is currently being dragged, in a different colour so it is
+    // obviously not committed yet.
     if (_grab == Grab::SegNew && _onColliders == colliders) {
-      const OfxPointD a = c.toCanonical(_pending.x1, _pending.y1);
-      const OfxPointD b = c.toCanonical(_pending.x2, _pending.y2);
-      setColour(c, kShadow);
-      c.draw->setLineWidth(c.ctx, 3.0f);
-      line(c, a.x, a.y, b.x, b.y);
-      setColour(c, kPending);
-      c.draw->setLineWidth(c.ctx, 1.0f);
-      line(c, a.x, a.y, b.x, b.y);
+      drawEntry(c, _pending, kPending, false);
     }
 
     if (tool) {
@@ -659,7 +725,7 @@ class ForceInteract : public OFX::OverlayInteract {
   Grab _grab = Grab::None;
   int _which = 0;
 
-  Slice _pending;          ///< the line being dragged, not yet committed
+  Entry _pending;          ///< what is being dragged, not yet committed
   int _segIndex = -1;
   int _segEnd = 0;
   bool _onColliders = false;  ///< which list the current drag belongs to
