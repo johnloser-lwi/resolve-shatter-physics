@@ -24,10 +24,14 @@ inline void mixF(uint64_t& h, float f) {
 
 inline void mixForce(uint64_t& h, const ForceField& f) {
   mix(h, f.enabled ? 1u : 0u);
+  mix(h, uint64_t(f.shape));
   mixF(h, f.posX);
   mixF(h, f.posY);
   mixF(h, f.radius);
+  mixF(h, f.direction);
+  mixF(h, f.width);
   mixF(h, f.strength);
+  mixF(h, f.delay);
 }
 
 }  // namespace

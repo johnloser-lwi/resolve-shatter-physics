@@ -181,6 +181,69 @@ LabelResult labelComponents(const std::vector<uint8_t>& mask,
   return lr;
 }
 
+void fillUnlabelled(LabelResult& lr, const std::vector<uint8_t>& mask, int iterations) {
+  if (lr.count == 0 || lr.labels.empty()) return;
+
+  const int w = lr.width, h = lr.height;
+
+  for (int pass = 0; pass < iterations; ++pass) {
+    // Written into a copy, so a pixel filled this pass cannot immediately seed
+    // the one next to it. Filling in place would let one region creep along the
+    // whole barrier and swallow the cut.
+    std::vector<int32_t> next = lr.labels;
+    bool changed = false;
+
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        const std::size_t p = std::size_t(y) * std::size_t(w) + std::size_t(x);
+        if (lr.labels[p] != 0 || !mask[p]) continue;
+
+        // 4-connectivity, and the LOWEST neighbouring label wins. Lowest rather
+        // than first-found so the result does not depend on scan order, which
+        // is what keeps a cut reproducible.
+        int32_t best = 0;
+        const int dx[4] = {-1, 1, 0, 0};
+        const int dy[4] = {0, 0, -1, 1};
+        for (int k = 0; k < 4; ++k) {
+          const int nx = x + dx[k], ny = y + dy[k];
+          if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+          const int32_t l = lr.labels[std::size_t(ny) * std::size_t(w) + std::size_t(nx)];
+          if (l != 0 && (best == 0 || l < best)) best = l;
+        }
+        if (best != 0) {
+          next[p] = best;
+          changed = true;
+        }
+      }
+    }
+    lr.labels.swap(next);
+    if (!changed) break;
+  }
+
+  // The stats were gathered before these pixels existed, so bring them up to
+  // date; despeckle and the shard build both read them.
+  for (ComponentStat& c : lr.stats) c = ComponentStat{};
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const std::size_t p = std::size_t(y) * std::size_t(w) + std::size_t(x);
+      const int32_t l = lr.labels[p];
+      if (l == 0) continue;
+      ComponentStat& c = lr.stats[std::size_t(l)];
+      if (c.area == 0) {
+        c.bbox = RectI{x, y, x + 1, y + 1};
+      } else {
+        c.bbox.x1 = std::min(c.bbox.x1, x);
+        c.bbox.y1 = std::min(c.bbox.y1, y);
+        c.bbox.x2 = std::max(c.bbox.x2, x + 1);
+        c.bbox.y2 = std::max(c.bbox.y2, y + 1);
+      }
+      c.sumX += double(x) + 0.5;
+      c.sumY += double(y) + 0.5;
+      ++c.area;
+    }
+  }
+}
+
 void despeckle(LabelResult& lr, int minArea) {
   if (lr.count == 0 || minArea <= 1) return;
 

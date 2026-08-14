@@ -121,7 +121,13 @@ shp::Pattern parsePattern(const std::string& s) {
   if (s == "grid") return shp::Pattern::Grid;
   if (s == "alpha") return shp::Pattern::Alpha;
   if (s == "map") return shp::Pattern::Map;
+  if (s == "manual") return shp::Pattern::Manual;
   return shp::Pattern::Voronoi;
+}
+
+// "x1,y1,x2,y2" in normalized frame coordinates.
+bool parseSlice(const std::string& s, shp::Slice& out) {
+  return std::sscanf(s.c_str(), "%f,%f,%f,%f", &out.x1, &out.y1, &out.x2, &out.y2) == 4;
 }
 
 shp::ForceMode parseForceMode(const std::string& s) {
@@ -251,6 +257,21 @@ int main(int argc, char** argv) {
     else if (a == "--blur") mb.enabled = true;
     else if (a == "--shutter") mb.shutterAngle = next(180.0f);
     else if (a == "--blur-samples") mb.samples = int(next(8));
+    else if (a == "--dir1") { fp.f1.shape = shp::ForceShape::Directional; fp.f1.direction = next(90.0f); }
+    else if (a == "--width1") fp.f1.width = next(0.5f);
+    else if (a == "--delay1") fp.f1.delay = next(0.0f);
+    else if (a == "--f2") fp.f2.enabled = true;
+    else if (a == "--f2x") fp.f2.posX = next(0.5f);
+    else if (a == "--f2y") fp.f2.posY = next(0.5f);
+    else if (a == "--f2-radius") fp.f2.radius = next(0.4f);
+    else if (a == "--f2-strength") fp.f2.strength = next(1.0f);
+    else if (a == "--dir2") { fp.f2.shape = shp::ForceShape::Directional; fp.f2.direction = next(90.0f); }
+    else if (a == "--width2") fp.f2.width = next(0.5f);
+    else if (a == "--delay2") fp.f2.delay = next(0.0f);
+    else if (a == "--slice" && i + 1 < argc) {
+      shp::Slice sl;
+      if (parseSlice(argv[++i], sl)) sp.slices.push_back(sl);
+    }
   }
 
   Bitmap src;

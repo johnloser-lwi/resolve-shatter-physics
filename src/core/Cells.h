@@ -28,6 +28,25 @@ enum class Pattern {
   Grid    = 2,
   Alpha   = 3,   ///< one connected alpha region per piece
   Map     = 4,   ///< regions of constant colour in a second input
+  Manual  = 5,   ///< no generated pattern at all; only the slices you draw
+};
+
+/** @brief A cut drawn by hand, in normalized [0,1] frame coordinates.
+ *
+ * A finite segment, not an infinite line, and that distinction is the whole
+ * design. An infinite line would also cut every other object that happened to
+ * lie along it, which is astonishing when you only meant to halve one letter. A
+ * segment cuts what it actually crosses and nothing else -- and a segment that
+ * stops halfway through a piece does not separate it at all, which is exactly
+ * how a real knife behaves.
+ */
+struct Slice {
+  float x1 = 0.0f, y1 = 0.0f;
+  float x2 = 0.0f, y2 = 0.0f;
+
+  bool operator==(const Slice& o) const {
+    return x1 == o.x1 && y1 == o.y1 && x2 == o.x2 && y2 == o.y2;
+  }
 };
 
 struct ShapeParams {
@@ -44,6 +63,12 @@ struct ShapeParams {
   float bridgeRadius = 0.0f;     ///< fraction of frame height
   int shapeSeed = 1;
 
+  /// Cuts drawn by hand. These apply on TOP of whatever pattern is selected, so
+  /// a generated shatter can be tidied up by hand rather than being an
+  /// all-or-nothing choice. Pattern::Manual simply generates nothing, leaving
+  /// these as the only thing that separates anything.
+  std::vector<Slice> slices;
+
   /// Whether the caller needs collision polygons. Building them costs real time
   /// on a thousand-shard frame and the ballistic mode never looks at them.
   bool buildPolygons = false;
@@ -53,7 +78,7 @@ struct ShapeParams {
            brickRows == o.brickRows && brickOffset == o.brickOffset && mapLevels == o.mapLevels &&
            alphaThreshold == o.alphaThreshold && minPieceArea == o.minPieceArea &&
            bridgeRadius == o.bridgeRadius && shapeSeed == o.shapeSeed &&
-           buildPolygons == o.buildPolygons;
+           buildPolygons == o.buildPolygons && slices == o.slices;
   }
   bool operator!=(const ShapeParams& o) const { return !(*this == o); }
 };

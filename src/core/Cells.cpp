@@ -189,8 +189,9 @@ std::vector<int32_t> buildCellMap(int w, int h, const ShapeParams& params, int& 
 
     case Pattern::Alpha:
     case Pattern::Map:
-      // No generated pattern: connectivity comes from the alpha itself, or from
-      // the map image, which the caller supplies as keys.
+    case Pattern::Manual:
+      // No generated pattern: separation comes from the alpha itself, from the
+      // map image which the caller supplies as keys, or from hand-drawn slices.
       cellCountOut = 1;
       break;
   }
@@ -228,6 +229,58 @@ std::vector<int32_t> buildMapKeys(const ConstImageView& map, int w, int h, int l
     }
   }
   return keys;
+}
+
+// Squared distance from a point to a line SEGMENT (not to its infinite line).
+//
+// The clamp is what makes a slice stop where it was drawn instead of carrying on
+// across the frame.
+float distSqToSegment(float px, float py, const Vec2& a, const Vec2& b) {
+  const Vec2 ab(b.x - a.x, b.y - a.y);
+  const Vec2 ap(px - a.x, py - a.y);
+  const float len2 = LengthSq(ab);
+  float t = len2 > 1e-12f ? Dot(ap, ab) / len2 : 0.0f;
+  t = Clamp01(t);
+  const float dx = ap.x - ab.x * t;
+  const float dy = ap.y - ab.y * t;
+  return dx * dx + dy * dy;
+}
+
+/// Cut the drawn slices out of the connectivity mask.
+///
+/// Thickness is deliberately just over one pixel. An 8-connected labeller can
+/// leak diagonally through a one-pixel-wide diagonal line, so a hairline barrier
+/// would sometimes fail to cut at all -- and it would fail as a function of the
+/// angle, which is the worst kind of intermittent. 0.75 of a pixel of radius
+/// closes every diagonal while keeping the cut narrow enough that
+/// fillUnlabelled can hand every barrier pixel back to a neighbour.
+void applySlices(std::vector<uint8_t>& connectMask, int w, int h,
+                 const std::vector<Slice>& slices) {
+  constexpr float kRadius = 0.75f;
+  const float r2 = kRadius * kRadius;
+
+  for (const Slice& s : slices) {
+    const Vec2 a(s.x1 * float(w), s.y1 * float(h));
+    const Vec2 b(s.x2 * float(w), s.y2 * float(h));
+
+    // A slice dragged out and released on the spot is a click, not a cut.
+    if (LengthSq(Vec2(b.x - a.x, b.y - a.y)) < 1.0f) continue;
+
+    // Only the segment's own bounding box can be within the radius, so the scan
+    // is proportional to the cut's length rather than to the frame.
+    const int x1 = std::max(0, int(std::floor(std::min(a.x, b.x) - kRadius - 1.0f)));
+    const int y1 = std::max(0, int(std::floor(std::min(a.y, b.y) - kRadius - 1.0f)));
+    const int x2 = std::min(w, int(std::ceil(std::max(a.x, b.x) + kRadius + 2.0f)));
+    const int y2 = std::min(h, int(std::ceil(std::max(a.y, b.y) + kRadius + 2.0f)));
+
+    for (int y = y1; y < y2; ++y) {
+      for (int x = x1; x < x2; ++x) {
+        const std::size_t p = std::size_t(y) * std::size_t(w) + std::size_t(x);
+        if (!connectMask[p]) continue;
+        if (distSqToSegment(float(x) + 0.5f, float(y) + 0.5f, a, b) <= r2) connectMask[p] = 0;
+      }
+    }
+  }
 }
 
 // Boundary pixels of each shard, which is all the convex hull needs.
@@ -294,9 +347,14 @@ std::shared_ptr<const ShatterGeometry> buildGeometry(const ConstImageView& src,
   //    Radius is a fraction of frame height for the resolution-independence
   //    reason at the top of this file.
   const int bridgePx = int(std::lround(double(params.bridgeRadius) * double(h)));
-  std::vector<uint8_t> dilated;
-  if (bridgePx > 0) dilated = dilateMask(mask, w, h, bridgePx);
-  const std::vector<uint8_t>& connectMask = bridgePx > 0 ? dilated : mask;
+  std::vector<uint8_t> connectMask = bridgePx > 0 ? dilateMask(mask, w, h, bridgePx) : mask;
+
+  // 2b. Hand-drawn cuts, taken out of the connectivity mask so that whatever a
+  //     slice fully crosses stops being one piece. Applied AFTER bridging, so a
+  //     cut always wins over a bridge -- the reverse would let a bridge quietly
+  //     heal a cut the user had just drawn.
+  const bool sliced = !params.slices.empty();
+  if (sliced) applySlices(connectMask, w, h, params.slices);
 
   // 3. The pattern, as a per-pixel key. Two touching pixels only end up in the
   //    same piece when their keys agree, so this is where a generated pattern
@@ -314,17 +372,21 @@ std::shared_ptr<const ShatterGeometry> buildGeometry(const ConstImageView& src,
   if (effective.pattern == Pattern::Map) {
     keys = buildMapKeys(*map, w, h, effective.mapLevels);
     keyPtr = &keys;
-  } else if (effective.pattern != Pattern::Alpha) {
+  } else if (effective.pattern != Pattern::Alpha && effective.pattern != Pattern::Manual) {
     int cellCount = 0;
     keys = buildCellMap(w, h, effective, cellCount);
     keyPtr = &keys;
   }
 
-  // 4. Label. Connectivity from the (possibly dilated) mask, ownership from the
-  //    true one, so bounding boxes stay exact.
+  // 4. Label. Connectivity from the (possibly dilated, possibly cut) mask,
+  //    ownership from the true one, so bounding boxes stay exact.
   LabelResult lr =
       labelComponents(connectMask, keyPtr, bridgePx > 0 ? &mask : nullptr, w, h);
   if (lr.count == 0) return geom;
+
+  // 4b. Hand back the pixels the cuts took out, so a slice separates without
+  //     erasing a hairline of the artwork along every cut.
+  if (sliced) fillUnlabelled(lr, mask, 2);
 
   // 5. Despeckle. Relative to frame area, so the same setting means the same
   //    thing at proxy and at delivery.

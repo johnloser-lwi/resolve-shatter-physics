@@ -34,20 +34,41 @@ enum PatternIndex {
   kPatternGrid    = 2,
   kPatternAlpha   = 3,   // one connected alpha region = one piece
   kPatternMap     = 4,   // custom shatter map on the second input
+  kPatternManual  = 5,   // nothing generated; only the cuts you draw
 };
 
+// Hand-drawn cuts. These apply on top of ANY pattern, so a generated shatter can
+// be corrected by hand instead of being an all-or-nothing choice.
+constexpr const char* kParamSlices      = "slices";
+constexpr const char* kParamSliceTool   = "sliceTool";
+constexpr const char* kParamClearSlices = "clearSlices";
+
 // ------------------------------------------------------------------ Forces
-constexpr const char* kParamForce1Enabled  = "force1Enabled";
-constexpr const char* kParamForce1Pos      = "force1Pos";
-constexpr const char* kParamForce1Radius   = "force1Radius";
-constexpr const char* kParamForce1Strength = "force1Strength";
-constexpr const char* kParamForce2Enabled  = "force2Enabled";
-constexpr const char* kParamForce2Pos      = "force2Pos";
-constexpr const char* kParamForce2Radius   = "force2Radius";
-constexpr const char* kParamForce2Strength = "force2Strength";
-constexpr const char* kParamForceMode      = "forceMode";
-constexpr const char* kParamWaveSpeed      = "waveSpeed";
-constexpr const char* kParamFalloff        = "falloff";
+constexpr const char* kParamForce1Enabled   = "force1Enabled";
+constexpr const char* kParamForce1Shape     = "force1Shape";
+constexpr const char* kParamForce1Pos       = "force1Pos";
+constexpr const char* kParamForce1Radius    = "force1Radius";
+constexpr const char* kParamForce1Direction = "force1Direction";
+constexpr const char* kParamForce1Width     = "force1Width";
+constexpr const char* kParamForce1Strength  = "force1Strength";
+constexpr const char* kParamForce1Delay     = "force1Delay";
+constexpr const char* kParamForce2Enabled   = "force2Enabled";
+constexpr const char* kParamForce2Shape     = "force2Shape";
+constexpr const char* kParamForce2Pos       = "force2Pos";
+constexpr const char* kParamForce2Radius    = "force2Radius";
+constexpr const char* kParamForce2Direction = "force2Direction";
+constexpr const char* kParamForce2Width     = "force2Width";
+constexpr const char* kParamForce2Strength  = "force2Strength";
+constexpr const char* kParamForce2Delay     = "force2Delay";
+constexpr const char* kParamForceMode       = "forceMode";
+constexpr const char* kParamWaveSpeed       = "waveSpeed";
+constexpr const char* kParamFalloff         = "falloff";
+
+// How a force reaches the pieces.
+enum ForceShapeIndex {
+  kForceRadial      = 0,  // blows outward from a point, inside a radius
+  kForceDirectional = 1,  // blows along an angle, inside a band of some width
+};
 
 // AE's Force block is 3D: a force has a Depth, and a piece detaches when the
 // expanding sphere reaches it. In 2D the depth axis is gone, so the useful part

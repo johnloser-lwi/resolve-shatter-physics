@@ -71,7 +71,7 @@ Put the clip on its own track and apply the effect. Then:
 
 | Control | What it does |
 |---|---|
-| Pattern | Glass (Voronoi), Bricks, Grid, Alpha Pieces, Custom Map |
+| Pattern | Glass (Voronoi), Bricks, Grid, Alpha Pieces, Custom Map, Manual Slices |
 | Pieces | Target cell count for Glass. The real count comes out lower, because cells that miss the image are discarded |
 | Irregularity | 0 is an even lattice, 1 is scattered like real broken glass |
 | Rows / Row Offset | Brick courses and their stagger. 0.5 is a normal running bond |
@@ -90,19 +90,64 @@ instance.
 **Custom Map** reads a second input (General context only) and makes one piece
 per region of flat colour. If nothing is connected it falls back to Glass.
 
+### Cutting by hand
+
+Turn on **Slice Tool** and drag across the viewer. Each drag adds one cut.
+
+A cut separates whatever it crosses **all the way through**. One that stops
+partway into a piece does not split it -- exactly like a real knife, and unlike
+the infinite lines most "slice" implementations use, which would also cut every
+other object that happened to lie along the same line. Drag the square handles at
+either end to adjust a cut afterwards; **Clear Cuts** removes them all, and undo
+brings them back.
+
+Cuts apply **on top of whichever pattern is selected**, so the usual workflow is
+to let Glass break the frame and then fix the two places it got wrong, rather
+than choosing between automatic and manual. The **Manual Slices** pattern
+generates nothing at all, leaving your cuts as the only thing that separates
+anything -- that is the mode for full control.
+
+The cuts live in the **Cuts** field as `x1,y1,x2,y2` in fractions of the frame,
+so they can be read, edited by hand, and copied between clips. Up to 64 of them.
+
+Slicing is lossless. The cut works by taking a hairline barrier out of the
+connectivity test, and those pixels are then handed back to a neighbouring piece
+rather than being left as background -- otherwise every cut would erase a
+one-pixel crack through the artwork. There is a test for that, and another for
+the case that actually bites: an eight-connected labeller steps diagonally, so a
+diagonal cut one pixel wide leaks and fails to separate anything.
+
 ### Forces
 
-Two independent forces, each with a position, a radius as a fraction of frame
-width, and a strength. **Negative strength pulls inward** instead of throwing.
+Two independent forces, each with a shape, a position, a strength and a delay.
+**Negative strength pulls inward** instead of throwing.
 
-Both are draggable in the viewer. Set the on-screen-controls dropdown to
-**Open FX Overlay** and each enabled force draws as a crosshair with two circles
--- the outer one is its actual reach, so everything outside it is untouched.
-Drag the centre handle to move the force; drag the small handle on the right of
-the outer circle to change its radius. The label carries the strength and says
-*push* or *pull*, because a negative strength is invisible from the geometry
-alone. A disabled force is not drawn: a handle that does nothing when dragged is
-worse than no handle.
+**Radial** blows outward from a point and fades with distance from it, bounded by
+a **Radius**. This is AE's force.
+
+**Directional** blows along an angle and fades with distance from the *line*,
+bounded by a **Width** across it. Its reach *along* the line is unlimited, so it
+behaves like wind rather than like a blast — a narrow band sweeping across the
+frame moves only what it passes over and leaves the rest standing. Direction uses
+the same convention as gravity: 180 is down, 90 is to the right.
+
+**Delay** is how many frames after the start each force fires, and it is a
+genuine second impulse rather than a blend. A delayed force arrives while the
+pieces are already in the air and changes their trajectory — break the frame with
+a radial burst, then sweep the debris sideways with a directional force eight
+frames later. Both simulation modes handle it as a timeline of impulses, so the
+maths stays closed-form in Ballistic and the solver applies each shove at substep
+resolution in Rigid Body.
+
+Both forces are draggable in the viewer. Set the on-screen-controls dropdown to
+**Open FX Overlay**. A radial force draws as a crosshair with two circles — the
+outer one is its actual reach, so everything outside it is untouched. A
+directional force draws its centre line, the two band edges, and an arrow showing
+which way it blows. Drag the centre handle to move it, the arrow tip to aim it,
+and the handle on the band edge (or on the circle, for radial) to resize it. The
+label carries the strength, says *push* or *pull*, and shows the delay, because
+none of those are visible from the geometry alone. A disabled force is not drawn:
+a handle that does nothing when dragged is worse than no handle.
 
 **Force Mode** replaces AE's 3D force depth, which has no meaning in 2D:
 
@@ -358,6 +403,21 @@ with blur on and demands it come back solid.
 bucket 15 reachable only by exactly 1.0, so the most common value in an alpha
 channel sits alone on a boundary and the tiniest dip below opaque -- a re-encode,
 a colour-managed round trip -- invalidates the analysis cache on every frame.
+
+**A cut is a barrier in the connectivity test, not a half-plane.** The tempting
+implementation is a per-pixel bitmask of which side of each cut a pixel falls on,
+which is exact and free — but it makes every cut an infinite line, so slicing one
+letter also slices whatever else lies along that line. Barriers cost a fill pass
+and are worth it. The barrier radius is 0.75 px rather than 0.5 because an
+eight-connected labeller steps diagonally: a thinner diagonal cut leaks, and it
+leaks as a function of the angle, which is the worst kind of intermittent.
+
+**Forces are impulses with a time, not a launch velocity.** Folding a delayed
+force into how a piece left would be simpler and would look completely wrong: the
+whole point is that it acts on something already moving. `Ballistic.h` walks the
+segments between impulses; the solver applies them in `releaseDue`. Detach timing
+deliberately depends only on geometry — not on mass, not on the randomness draw —
+so dragging Mass Variance does not shift when things let go.
 
 **There is no continuous collision detection.** A piece thrown hard enough can
 pass through a thin obstacle in one substep. The integrator clamps per-substep

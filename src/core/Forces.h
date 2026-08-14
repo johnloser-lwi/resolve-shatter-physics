@@ -30,11 +30,33 @@ enum class Falloff {
   InverseSquare = 2,
 };
 
+enum class ForceShape {
+  Radial      = 0,  ///< blows outward from a point, inside a radius
+  Directional = 1,  ///< blows along an angle, inside a band of some width
+};
+
 struct ForceField {
   bool enabled = false;
+  ForceShape shape = ForceShape::Radial;
   float posX = 0.5f, posY = 0.5f;  ///< normalized [0,1] within the frame
-  float radius = 0.4f;             ///< fraction of frame WIDTH
+
+  float radius = 0.4f;             ///< Radial only. Fraction of frame WIDTH.
+
+  /// Directional only. Degrees, same convention as gravity: 180 is down, 0 is
+  /// up, 90 is to the right.
+  float direction = 90.0f;
+  /// Directional only. Full width of the band, as a fraction of frame width.
+  /// Reach along the direction is unlimited -- it is a wind, not a puff.
+  float width = 0.5f;
+
   float strength = 1.0f;
+
+  /// Frames after the shatter's start before this force fires.
+  ///
+  /// This is what lets one force break the frame and a second one, arriving
+  /// later, shove the pieces mid-flight. Both simulation modes handle it as a
+  /// genuine second impulse rather than as a blend of two launches.
+  float delay = 0.0f;
 };
 
 struct ForceParams {
@@ -140,97 +162,118 @@ SHP_HD inline float MassOf(const ShardSim& s, const FrameScale& fs, const Physic
   return m < 0.05f ? 0.05f : m;
 }
 
-/** @brief Distance in pixels from a shard to the nearer of the enabled forces.
+/** @brief What one force does to one shard, and when.
  *
- * Returns a negative number when no force is enabled, which callers read as
- * "nothing is going to reach this shard". */
-SHP_HD inline float NearestForceDistance(const ShardSim& s, const ForceParams& fp,
-                                         const FrameScale& fs) {
-  float best = -1.0f;
-  const ForceField* fields[2] = {&fp.f1, &fp.f2};
-  for (int i = 0; i < 2; ++i) {
-    if (!fields[i]->enabled) continue;
-    const float px = fields[i]->posX * fs.width;
-    const float py = fields[i]->posY * fs.height;
-    const float d = Length(Vec2(s.cx - px, s.cy - py));
-    if (best < 0.0f || d < best) best = d;
-  }
-  return best;
+ * Forces are impulses with a time, not a single blended launch velocity. That
+ * distinction is what makes a delayed second force interesting: it arrives while
+ * the piece is already in the air and changes its trajectory, rather than being
+ * averaged into how it left in the first place. */
+struct ForceImpulse {
+  bool hits = false;      ///< does this force reach this shard at all
+  float time = 1e9f;      ///< absolute clip frame it arrives on
+  Vec2 linear{0.0f, 0.0f};///< added to velocity, px/frame, already mass-divided
+};
+
+/** @brief Unit vector for an angle in the gravity convention: 180 is down. */
+SHP_HD inline Vec2 AngleToVector(float degrees) {
+  const float a = degrees * kPi / 180.0f;
+  return Vec2(sinf(a), -cosf(a));
 }
 
-/** @brief The frame this shard lets go on.
+/** @brief The purely geometric half of a force: whether it reaches a shard,
+ *  how hard, which way, and when.
  *
- * A very large value means never. Returning a float rather than an int lets the
- * radial wave arrive between frames, so the break front advances smoothly
- * instead of in visible steps. */
-SHP_HD inline float DetachFrame(const ShardSim& s, const ForceParams& fp, const FrameScale& fs) {
-  const float start = float(fp.startFrame);
+ * Split out from the impulse deliberately. Timing depends only on geometry --
+ * not on the shard's mass, and not on the randomness draw -- so detach times
+ * stay stable when someone drags Mass Variance, and the solver can ask "when"
+ * without having to first work out "how hard".
+ */
+struct ForceReach {
+  bool hits = false;
+  float k = 0.0f;          ///< falloff, 1 at the centre of the force, 0 at its edge
+  Vec2 dir{0.0f, 0.0f};    ///< unit push direction
+  float time = 1e9f;       ///< absolute clip frame it arrives on
+};
 
-  switch (fp.mode) {
-    case ForceMode::InsideRadius: {
-      // Only pieces some force actually covers ever detach. Everything else
-      // stays exactly where it was drawn, which is what makes this mode useful
-      // for punching a hole through something and leaving the rest standing.
-      const ForceField* fields[2] = {&fp.f1, &fp.f2};
-      for (int i = 0; i < 2; ++i) {
-        if (!fields[i]->enabled) continue;
-        const float px = fields[i]->posX * fs.width;
-        const float py = fields[i]->posY * fs.height;
-        const float r = fields[i]->radius * fs.width;
-        if (LengthSq(Vec2(s.cx - px, s.cy - py)) <= r * r) return start;
-      }
-      return 1e9f;
-    }
+/** @brief Where and when one force touches one shard.
+ *
+ * Radial forces fall off with distance from a POINT and push outward from it.
+ * Directional forces fall off with distance from a LINE and push along it --
+ * reach along the line is unlimited, because a wind that stops after a few
+ * hundred pixels is not what anyone means by a directional force.
+ */
+SHP_HD inline ForceReach ReachOf(const ForceField& f, const ForceParams& fp,
+                                 const FrameScale& fs, const ShardSim& s, uint32_t shardId) {
+  ForceReach out;
+  if (!f.enabled) return out;
 
-    case ForceMode::RadialWave: {
-      const float d = NearestForceDistance(s, fp, fs);
-      if (d < 0.0f) return 1e9f;
-      const float speed = fp.waveSpeed * fs.width;
-      if (speed <= 1e-6f) return 1e9f;
-      return start + d / speed;
-    }
+  const Vec2 origin(f.posX * fs.width, f.posY * fs.height);
+  const Vec2 rel(s.cx - origin.x, s.cy - origin.y);
+  float waveDist = 0.0f;
 
-    case ForceMode::AllAtStart:
-    default:
-      return start;
-  }
-}
+  if (f.shape == ForceShape::Directional) {
+    out.dir = AngleToVector(f.direction);
 
-/** @brief Initial linear velocity, px/frame, at the moment a shard detaches. */
-SHP_HD inline Vec2 InitialVelocity(const ShardSim& s, const ForceParams& fp,
-                                   const PhysicsParams& pp, const FrameScale& fs,
-                                   uint32_t shardId, float mass) {
-  Vec2 v(0.0f, 0.0f);
+    // Falloff is across the band, measured perpendicular to the axis.
+    const Vec2 perp(-out.dir.y, out.dir.x);
+    const float half = f.width * fs.width * 0.5f;
+    if (half <= 1e-6f) return out;
+    out.k = ApplyFalloff(fabsf(Dot(rel, perp)) / half, fp.falloff);
 
-  const ForceField* fields[2] = {&fp.f1, &fp.f2};
-  for (int i = 0; i < 2; ++i) {
-    const ForceField& f = *fields[i];
-    if (!f.enabled) continue;
-
-    const float px = f.posX * fs.width;
-    const float py = f.posY * fs.height;
+    // For the wave, the front travels ALONG the direction. Anything at or
+    // behind the axis line has already been passed, so it sits at zero -- the
+    // alternative, a negative distance, would have upwind pieces detaching
+    // before the shatter had started.
+    const float along = Dot(rel, out.dir);
+    waveDist = along > 0.0f ? along : 0.0f;
+  } else {
     const float r = f.radius * fs.width;
-    if (r <= 1e-6f) continue;
+    if (r <= 1e-6f) return out;
 
-    const Vec2 away(s.cx - px, s.cy - py);
-    const float dist = Length(away);
-    const float k = ApplyFalloff(dist / r, fp.falloff);
-    if (k <= 0.0f) continue;
+    const float dist = Length(rel);
+    out.k = ApplyFalloff(dist / r, fp.falloff);
+    waveDist = dist;
 
     // A shard sitting exactly on the force point has no direction to go, so it
     // is given one from its own hash rather than left as the only piece that
     // never moves.
-    Vec2 dir = Normalize(away);
-    if (dir.x == 0.0f && dir.y == 0.0f) {
+    out.dir = Normalize(rel);
+    if (out.dir.x == 0.0f && out.dir.y == 0.0f) {
       const float a = Hash01(shardId, uint32_t(fp.seed), kChanVelAngle) * 2.0f * kPi;
-      dir = Vec2(cosf(a), sinf(a));
+      out.dir = Vec2(cosf(a), sinf(a));
     }
-
-    v += dir * (f.strength * k * kVelocityPerStrength * fs.width);
   }
 
-  // Randomness scatters both the direction and the magnitude. Scaling the jitter
-  // by the speed the shard already has keeps a gentle shatter gentle -- an
+  if (out.k <= 0.0f) return out;
+
+  out.hits = true;
+  out.time = float(fp.startFrame) + f.delay;
+
+  if (fp.mode == ForceMode::RadialWave) {
+    const float speed = fp.waveSpeed * fs.width;
+    // A stalled wave never arrives anywhere, which is more honest than
+    // arriving everywhere at once.
+    if (speed <= 1e-6f) {
+      out.hits = false;
+      return out;
+    }
+    out.time += waveDist / speed;
+  }
+  return out;
+}
+
+/** @brief The velocity one force adds to one shard, and when. */
+SHP_HD inline ForceImpulse EvaluateForce(const ForceField& f, const ForceParams& fp,
+                                         const PhysicsParams& pp, const FrameScale& fs,
+                                         const ShardSim& s, uint32_t shardId, float mass) {
+  ForceImpulse out;
+  const ForceReach r = ReachOf(f, fp, fs, s, shardId);
+  if (!r.hits) return out;
+
+  Vec2 v = r.dir * (f.strength * r.k * kVelocityPerStrength * fs.width);
+
+  // Randomness scatters both direction and magnitude. Scaling the jitter by the
+  // speed this impulse already carries keeps a gentle shatter gentle -- an
   // absolute jitter would dominate whenever the forces were weak, and every
   // piece would fly off at the same speed regardless of the strength dial.
   if (pp.randomness > 0.0f) {
@@ -240,7 +283,61 @@ SHP_HD inline Vec2 InitialVelocity(const ShardSim& s, const ForceParams& fp,
     v += Vec2(cosf(a), sinf(a)) * (speed * pp.randomness * m);
   }
 
-  return v * (1.0f / mass);
+  out.hits = true;
+  out.linear = v * (1.0f / mass);
+  out.time = r.time;
+  return out;
+}
+
+/** @brief Both forces, in the order they arrive.
+ *
+ * @param out must have room for two entries. Returns how many actually hit.
+ *
+ * Sorted by time so callers can walk them as a timeline without re-checking.
+ * Two entries makes that a compare-and-swap rather than a sort.
+ */
+SHP_HD inline int GatherImpulses(const ShardSim& s, const ForceParams& fp,
+                                 const PhysicsParams& pp, const FrameScale& fs,
+                                 uint32_t shardId, float mass, ForceImpulse* out) {
+  const ForceImpulse a = EvaluateForce(fp.f1, fp, pp, fs, s, shardId, mass);
+  const ForceImpulse b = EvaluateForce(fp.f2, fp, pp, fs, s, shardId, mass);
+
+  int n = 0;
+  if (a.hits) out[n++] = a;
+  if (b.hits) out[n++] = b;
+  if (n == 2 && out[1].time < out[0].time) {
+    const ForceImpulse t = out[0];
+    out[0] = out[1];
+    out[1] = t;
+  }
+  return n;
+}
+
+/** @brief The frame this shard lets go on.
+ *
+ * A very large value means never. Returning a float rather than an int lets the
+ * radial wave arrive between frames, so the break front advances smoothly
+ * instead of in visible steps.
+ *
+ * A piece can detach BEFORE any force reaches it: in All At Once everything lets
+ * go on the start frame, so a delayed force finds pieces that have already been
+ * falling for a while. That is the whole point of the delay.
+ */
+SHP_HD inline float DetachFrame(const ShardSim& s, const ForceParams& fp, const FrameScale& fs) {
+  // Everything lets go at once, whether or not a force ever reaches it. Pieces
+  // outside every force simply fall.
+  if (fp.mode == ForceMode::AllAtStart) return float(fp.startFrame);
+
+  // Otherwise a piece only moves once something actually arrives, and it moves
+  // when the FIRST thing arrives. Only the geometry matters here, which is why
+  // this can ask ReachOf directly instead of building impulses it would discard.
+  const ForceReach a = ReachOf(fp.f1, fp, fs, s, uint32_t(s.area));
+  const ForceReach b = ReachOf(fp.f2, fp, fs, s, uint32_t(s.area));
+
+  float best = 1e9f;
+  if (a.hits && a.time < best) best = a.time;
+  if (b.hits && b.time < best) best = b.time;
+  return best;
 }
 
 /** @brief Initial angular velocity, rad/frame.

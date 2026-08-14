@@ -60,6 +60,13 @@ struct Body {
   bool active = false;     ///< false until detachFrame; an inactive body is an obstacle
   bool culled = false;     ///< left the frame for good and stopped being simulated
 
+  /// Forces waiting to arrive, in time order. A delayed force is a genuine
+  /// second shove mid-flight, so it cannot be folded into the launch velocity.
+  ForceImpulse pending[2];
+  int pendingCount = 0;
+  int pendingNext = 0;     ///< how many have already been applied
+  float spinAtDetach = 0.0f;
+
   Vec2 worldPos() const { return rest + pos; }
 };
 
@@ -88,16 +95,21 @@ class World {
              const FrameScale& fs);
 
   /// Advance exactly one frame, in `substeps` equal pieces.
-  /// @param frame the frame being stepped INTO, used to activate bodies whose
-  ///        detach time has arrived.
+  /// @param frame the frame being stepped INTO. Bodies whose detach time has
+  ///        arrived are released, and impulses that fall due within the frame
+  ///        are applied at substep resolution.
   void step(float frame);
 
   const std::vector<Body>& bodies() const { return _bodies; }
   const WorldParams& params() const { return _params; }
 
+  /// Where the simulation currently sits, in absolute clip frames. Advances by
+  /// one substep at a time, which is the resolution impulses land at.
+  float time() const { return _time; }
+
  private:
   void integrate(float dt);
-  void activateDue(float frame);
+  void releaseDue(float now);
   void solveContacts(float dt);
   void collectShardContacts();
   void collectStaticContacts();
@@ -115,6 +127,7 @@ class World {
   std::vector<Body> _bodies;
   std::vector<Contact> _contacts;
   WorldParams _params;
+  float _time = 0.0f;
 
   // Broadphase scratch, kept between steps so a long simulation is not a long
   // series of allocations.

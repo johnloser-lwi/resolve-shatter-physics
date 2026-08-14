@@ -70,6 +70,19 @@ LabelResult labelComponents(const std::vector<uint8_t>& mask,
                             const std::vector<uint8_t>* writeMask,
                             int w, int h);
 
+/** @brief Give a label to pixels that are inside @p mask but were left unlabelled.
+ *
+ * Manual slices work by cutting a thin barrier out of the connectivity mask, so
+ * the pieces on either side stop being connected. Those barrier pixels would
+ * otherwise end up as background -- a hairline transparent crack along every
+ * cut, which is loss the user did not ask for. This hands each of them to a
+ * neighbour instead, so a slice separates without erasing.
+ *
+ * @param iterations how many one-pixel rings to fill. The barrier is under two
+ *        pixels wide, so two passes always closes it.
+ */
+void fillUnlabelled(LabelResult& lr, const std::vector<uint8_t>& mask, int iterations);
+
 /** @brief Drop components smaller than @p minArea and renumber the survivors.
  *
  * Renumbering matters: the compositor indexes shards by label - 1, so a gap in

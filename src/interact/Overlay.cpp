@@ -10,6 +10,7 @@
 
 #include "../EditBlock.h"
 #include "../ParamNames.h"
+#include "../SliceList.h"
 
 namespace shp {
 namespace {
@@ -122,12 +123,23 @@ std::string trimNum(double v, int decimals) {
 // What a force looks like at one instant.
 struct ForceView {
   bool enabled = false;
+  bool directional = false;
   double nx = 0.5, ny = 0.5;
-  double radius = 0.4;   // fraction of frame width
+  double radius = 0.4;     // fraction of frame width, radial only
+  double direction = 90.0; // degrees, directional only
+  double width = 0.5;      // fraction of frame width, directional only
   double strength = 1.0;
+  double delay = 0.0;
 };
 
-enum class Grab { None, Centre, Radius };
+enum class Grab { None, Centre, Radius, Width, Direction, SliceEnd, SliceNew };
+
+constexpr Colour kCut = {1.00f, 0.28f, 0.34f, 0.95f};
+constexpr Colour kCutPending = {1.00f, 0.85f, 0.30f, 0.95f};
+
+// How far from the centre the rotate handle sits, in screen pixels. Fixed on
+// screen rather than in image space so the gesture feels the same at any zoom.
+constexpr double kDirHandleDist = 64.0;
 
 }  // namespace
 
@@ -145,14 +157,26 @@ class ForceInteract : public OFX::OverlayInteract {
     // next viewer refresh.
     try {
       addParamToSlaveTo(_effect->fetchBooleanParam(kParamForce1Enabled));
+      addParamToSlaveTo(_effect->fetchChoiceParam(kParamForce1Shape));
       addParamToSlaveTo(_effect->fetchDouble2DParam(kParamForce1Pos));
       addParamToSlaveTo(_effect->fetchDoubleParam(kParamForce1Radius));
+      addParamToSlaveTo(_effect->fetchDoubleParam(kParamForce1Direction));
+      addParamToSlaveTo(_effect->fetchDoubleParam(kParamForce1Width));
       addParamToSlaveTo(_effect->fetchDoubleParam(kParamForce1Strength));
+      addParamToSlaveTo(_effect->fetchDoubleParam(kParamForce1Delay));
       addParamToSlaveTo(_effect->fetchBooleanParam(kParamForce2Enabled));
+      addParamToSlaveTo(_effect->fetchChoiceParam(kParamForce2Shape));
       addParamToSlaveTo(_effect->fetchDouble2DParam(kParamForce2Pos));
       addParamToSlaveTo(_effect->fetchDoubleParam(kParamForce2Radius));
+      addParamToSlaveTo(_effect->fetchDoubleParam(kParamForce2Direction));
+      addParamToSlaveTo(_effect->fetchDoubleParam(kParamForce2Width));
       addParamToSlaveTo(_effect->fetchDoubleParam(kParamForce2Strength));
+      addParamToSlaveTo(_effect->fetchDoubleParam(kParamForce2Delay));
       addParamToSlaveTo(_effect->fetchChoiceParam(kParamForceMode));
+      // Without these the cuts would not repaint until something else forced a
+      // redraw, so a cut just drawn would appear to have been ignored.
+      addParamToSlaveTo(_effect->fetchStringParam(kParamSlices));
+      addParamToSlaveTo(_effect->fetchBooleanParam(kParamSliceTool));
     } catch (...) {
     }
   }
@@ -160,6 +184,8 @@ class ForceInteract : public OFX::OverlayInteract {
   bool draw(const OFX::DrawArgs& args) override {
     Ctx c;
     if (!build(c, args.pixelScale, gDrawContext)) return false;
+
+    drawSlices(c, args.time);
 
     // Force 2 first, so Force 1 lands on top -- it is the one enabled by
     // default and the one most drags are aimed at.
@@ -172,6 +198,36 @@ class ForceInteract : public OFX::OverlayInteract {
     Ctx c;
     if (!build(c, args.pixelScale, nullptr)) return false;
 
+    // Existing cut endpoints come first: once a cut is drawn, adjusting it is
+    // the commoner intent than drawing another one straight through it.
+    {
+      const std::vector<Slice> cuts = readSlices(args.time);
+      for (std::size_t i = 0; i < cuts.size(); ++i) {
+        for (int e = 0; e < 2; ++e) {
+          const OfxPointD p = c.toCanonical(e == 0 ? cuts[i].x1 : cuts[i].x2,
+                                            e == 0 ? cuts[i].y1 : cuts[i].y2);
+          if (nearPoint(c, args.penPosition, p.x, p.y)) {
+            _sliceIndex = int(i);
+            _sliceEnd = e;
+            _grab = Grab::SliceEnd;
+            BeginEdit(_effect, "Move Cut");
+            return true;
+          }
+        }
+      }
+    }
+
+    // With the tool armed, a drag anywhere else starts a new cut.
+    if (sliceToolOn(args.time)) {
+      double nx = 0.0, ny = 0.0;
+      c.toNormalized(args.penPosition, nx, ny);
+      _pending.x1 = _pending.x2 = float(nx);
+      _pending.y1 = _pending.y2 = float(ny);
+      _grab = Grab::SliceNew;
+      BeginEdit(_effect, "Add Cut");
+      return true;
+    }
+
     // Force 1 is tested first so that two overlapping forces resolve the same
     // way they draw: whatever is on top is what you grab.
     for (int i = 0; i < 2; ++i) {
@@ -183,10 +239,26 @@ class ForceInteract : public OFX::OverlayInteract {
         beginDrag(i, Grab::Centre);
         return true;
       }
-      const double r = f.radius * c.width();
-      if (nearPoint(c, args.penPosition, centre.x + r, centre.y)) {
-        beginDrag(i, Grab::Radius);
-        return true;
+
+      if (f.directional) {
+        double dx, dy;
+        dirVector(f.direction, dx, dy);
+        const double aLen = c.sx(kDirHandleDist);
+        if (nearPoint(c, args.penPosition, centre.x + dx * aLen, centre.y + dy * aLen)) {
+          beginDrag(i, Grab::Direction);
+          return true;
+        }
+        const double half = f.width * c.width() * 0.5;
+        if (nearPoint(c, args.penPosition, centre.x - dy * half, centre.y + dx * half)) {
+          beginDrag(i, Grab::Width);
+          return true;
+        }
+      } else {
+        const double r = f.radius * c.width();
+        if (nearPoint(c, args.penPosition, centre.x + r, centre.y)) {
+          beginDrag(i, Grab::Radius);
+          return true;
+        }
       }
     }
     return false;
@@ -198,27 +270,104 @@ class ForceInteract : public OFX::OverlayInteract {
     Ctx c;
     if (!build(c, args.pixelScale, nullptr)) return false;
 
+    // Cuts are handled before the forces because they have their own storage --
+    // a string parameter rather than a pair of doubles.
+    if (_grab == Grab::SliceNew) {
+      double nx = 0.0, ny = 0.0;
+      c.toNormalized(args.penPosition, nx, ny);
+      _pending.x2 = float(nx);
+      _pending.y2 = float(ny);
+      return true;
+    }
+    if (_grab == Grab::SliceEnd) {
+      try {
+        std::vector<Slice> cuts = readSlices(args.time);
+        if (_sliceIndex >= 0 && _sliceIndex < int(cuts.size())) {
+          double nx = 0.0, ny = 0.0;
+          c.toNormalized(args.penPosition, nx, ny);
+          if (_sliceEnd == 0) {
+            cuts[std::size_t(_sliceIndex)].x1 = float(nx);
+            cuts[std::size_t(_sliceIndex)].y1 = float(ny);
+          } else {
+            cuts[std::size_t(_sliceIndex)].x2 = float(nx);
+            cuts[std::size_t(_sliceIndex)].y2 = float(ny);
+          }
+          writeSlices(cuts);
+        }
+      } catch (...) {
+      }
+      return true;
+    }
+
     try {
-      if (_grab == Grab::Centre) {
-        double nx = 0.0, ny = 0.0;
-        c.toNormalized(args.penPosition, nx, ny);
-        posParam(_which)->setValue(nx, ny);
-      } else {
-        const ForceView f = readForce(args.time, _which);
-        const OfxPointD centre = c.toCanonical(f.nx, f.ny);
-        const double r = std::fabs(args.penPosition.x - centre.x);
-        // Radius is a fraction of frame WIDTH, matching how Forces.h reads it.
-        // Clamped away from zero because a zero radius divides in the falloff.
-        const double frac = c.width() > 0.0 ? r / c.width() : 0.0;
-        radiusParam(_which)->setValue(std::max(0.002, std::min(10.0, frac)));
+      const ForceView f = readForce(args.time, _which);
+      const OfxPointD centre = c.toCanonical(f.nx, f.ny);
+      const double relX = args.penPosition.x - centre.x;
+      const double relY = args.penPosition.y - centre.y;
+
+      switch (_grab) {
+        case Grab::Centre: {
+          double nx = 0.0, ny = 0.0;
+          c.toNormalized(args.penPosition, nx, ny);
+          posParam(_which)->setValue(nx, ny);
+          break;
+        }
+        case Grab::Radius: {
+          // Radius is a fraction of frame WIDTH, matching how Forces.h reads
+          // it. Clamped away from zero because a zero radius divides in the
+          // falloff.
+          const double frac = c.width() > 0.0 ? std::fabs(relX) / c.width() : 0.0;
+          radiusParam(_which)->setValue(std::max(0.002, std::min(10.0, frac)));
+          break;
+        }
+        case Grab::Width: {
+          // Only the component across the band counts, so sliding along the
+          // direction does not fight the drag.
+          double dx, dy;
+          dirVector(f.direction, dx, dy);
+          const double across = std::fabs(relX * -dy + relY * dx);
+          const double frac = c.width() > 0.0 ? (across * 2.0) / c.width() : 0.0;
+          widthParam(_which)->setValue(std::max(0.004, std::min(10.0, frac)));
+          break;
+        }
+        case Grab::Direction: {
+          // atan2 in the canonical frame, inverted back into the core's
+          // convention where 180 is down. Same single negation as dirVector.
+          const double deg = std::atan2(relX, relY) * 180.0 / 3.14159265358979323846;
+          directionParam(_which)->setValue(deg < 0.0 ? deg + 360.0 : deg);
+          break;
+        }
+        case Grab::None:
+          break;
       }
     } catch (...) {
     }
     return true;
   }
 
-  bool penUp(const OFX::PenArgs&) override {
+  bool penUp(const OFX::PenArgs& args) override {
     if (_grab == Grab::None) return false;
+
+    if (_grab == Grab::SliceNew) {
+      // A drag that went nowhere is a click, not a cut. Committing it would
+      // leave a zero-length entry that cuts nothing and still has to be found
+      // and deleted.
+      Ctx c;
+      const bool haveCtx = build(c, args.pixelScale, nullptr);
+      const double dx = double(_pending.x2 - _pending.x1) * (haveCtx ? c.width() : 1.0);
+      const double dy = double(_pending.y2 - _pending.y1) * (haveCtx ? c.height() : 1.0);
+      if (dx * dx + dy * dy >= 9.0) {
+        try {
+          std::vector<Slice> cuts = readSlices(args.time);
+          if (int(cuts.size()) < kMaxSlices) {
+            cuts.push_back(_pending);
+            writeSlices(cuts);
+          }
+        } catch (...) {
+        }
+      }
+    }
+
     endDrag();
     return true;
   }
@@ -237,6 +386,12 @@ class ForceInteract : public OFX::OverlayInteract {
   OFX::DoubleParam* radiusParam(int i) const {
     return _effect->fetchDoubleParam(i == 0 ? kParamForce1Radius : kParamForce2Radius);
   }
+  OFX::DoubleParam* widthParam(int i) const {
+    return _effect->fetchDoubleParam(i == 0 ? kParamForce1Width : kParamForce2Width);
+  }
+  OFX::DoubleParam* directionParam(int i) const {
+    return _effect->fetchDoubleParam(i == 0 ? kParamForce1Direction : kParamForce2Direction);
+  }
 
   void beginDrag(int which, Grab what) {
     _which = which;
@@ -244,12 +399,83 @@ class ForceInteract : public OFX::OverlayInteract {
     // Bracketing groups the whole drag into one undo step instead of one per
     // mouse-move, and without it Fusion keeps serving cached frames after the
     // drag because it was never told an edit happened.
-    BeginEdit(_effect, what == Grab::Centre ? "Move Force" : "Resize Force");
+    const char* label = what == Grab::Centre      ? "Move Force"
+                        : what == Grab::Direction ? "Aim Force"
+                                                  : "Resize Force";
+    BeginEdit(_effect, label);
   }
 
   void endDrag() {
     _grab = Grab::None;
     EndEdit(_effect);
+  }
+
+  bool sliceToolOn(double t) const {
+    bool on = false;
+    try {
+      _effect->fetchBooleanParam(kParamSliceTool)->getValueAtTime(t, on);
+    } catch (...) {
+    }
+    return on;
+  }
+
+  std::vector<Slice> readSlices(double t) const {
+    std::string s;
+    try {
+      _effect->fetchStringParam(kParamSlices)->getValueAtTime(t, s);
+    } catch (...) {
+    }
+    return ParseSlices(s);
+  }
+
+  void writeSlices(const std::vector<Slice>& cuts) const {
+    _effect->fetchStringParam(kParamSlices)->setValue(FormatSlices(cuts));
+  }
+
+  void drawSlices(const Ctx& c, double t) {
+    const std::vector<Slice> cuts = readSlices(t);
+    const bool tool = sliceToolOn(t);
+
+    for (std::size_t i = 0; i < cuts.size(); ++i) {
+      const OfxPointD a = c.toCanonical(cuts[i].x1, cuts[i].y1);
+      const OfxPointD b = c.toCanonical(cuts[i].x2, cuts[i].y2);
+
+      // Drawn dark-then-light so a cut stays readable over both bright and dark
+      // footage, which matters more here than anywhere else on the overlay --
+      // a cut you cannot see is a cut you cannot fix.
+      setColour(c, kShadow);
+      c.draw->setLineWidth(c.ctx, 3.0f);
+      line(c, a.x, a.y, b.x, b.y);
+      setColour(c, kCut);
+      c.draw->setLineWidth(c.ctx, 1.0f);
+      line(c, a.x, a.y, b.x, b.y);
+
+      // Endpoint handles only while the tool is armed. Left on permanently they
+      // would clutter the viewer for anyone using a generated pattern who has
+      // no interest in the cuts.
+      if (tool) {
+        handle(c, a.x, a.y, kCut, 4.0);
+        handle(c, b.x, b.y, kCut, 4.0);
+      }
+    }
+
+    // The cut currently being dragged, in a different colour so it is obviously
+    // not committed yet.
+    if (_grab == Grab::SliceNew) {
+      const OfxPointD a = c.toCanonical(_pending.x1, _pending.y1);
+      const OfxPointD b = c.toCanonical(_pending.x2, _pending.y2);
+      setColour(c, kShadow);
+      c.draw->setLineWidth(c.ctx, 3.0f);
+      line(c, a.x, a.y, b.x, b.y);
+      setColour(c, kCutPending);
+      c.draw->setLineWidth(c.ctx, 1.0f);
+      line(c, a.x, a.y, b.x, b.y);
+    }
+
+    if (tool) {
+      setColour(c, kLabel);
+      text(c, "Slice Tool: drag to cut", c.rod.x1 + c.sx(16.0), c.rod.y2 - c.sy(20.0));
+    }
   }
 
   ForceView readForce(double t, int i) const {
@@ -258,13 +484,32 @@ class ForceInteract : public OFX::OverlayInteract {
     try {
       _effect->fetchBooleanParam(i == 0 ? kParamForce1Enabled : kParamForce2Enabled)
           ->getValueAtTime(t, f.enabled);
+      int shape = 0;
+      _effect->fetchChoiceParam(i == 0 ? kParamForce1Shape : kParamForce2Shape)
+          ->getValueAtTime(t, shape);
+      f.directional = shape == kForceDirectional;
       posParam(i)->getValueAtTime(t, f.nx, f.ny);
       radiusParam(i)->getValueAtTime(t, f.radius);
+      directionParam(i)->getValueAtTime(t, f.direction);
+      widthParam(i)->getValueAtTime(t, f.width);
       _effect->fetchDoubleParam(i == 0 ? kParamForce1Strength : kParamForce2Strength)
           ->getValueAtTime(t, f.strength);
+      _effect->fetchDoubleParam(i == 0 ? kParamForce1Delay : kParamForce2Delay)
+          ->getValueAtTime(t, f.delay);
     } catch (...) {
     }
     return f;
+  }
+
+  // Canonical-space unit vector for a force direction.
+  //
+  // The core works top-down and canonical coordinates run bottom-up, so the y
+  // component is negated exactly once, here. 180 degrees must point at the
+  // bottom of the viewer, the same way gravity does.
+  static void dirVector(double degrees, double& dx, double& dy) {
+    const double a = degrees * 3.14159265358979323846 / 180.0;
+    dx = std::sin(a);
+    dy = std::cos(a);  // canonical y is up, so "down" (180) gives cos = -1
   }
 
   void drawForce(const Ctx& c, const ForceView& f, const Colour& col, const char* name) {
@@ -274,40 +519,83 @@ class ForceInteract : public OFX::OverlayInteract {
     if (!f.enabled) return;
 
     const OfxPointD p = c.toCanonical(f.nx, f.ny);
-    const double r = f.radius * c.width();
-
-    // Reach of the force. Everything outside this circle is untouched by it, so
-    // it is the single most useful thing the overlay can show.
     c.draw->setLineWidth(c.ctx, 1.0f);
-    setColour(c, kRing);
-    ellipse(c, p.x, p.y, r, r);
 
-    setColour(c, col);
-    ellipse(c, p.x, p.y, r * 0.5, r * 0.5);
+    if (f.directional) {
+      double dx, dy;
+      dirVector(f.direction, dx, dy);
+      const double px = -dy, py = dx;  // perpendicular, for the band edges
+      const double half = f.width * c.width() * 0.5;
 
-    // Crosshair, sized in screen pixels so it stays findable at any zoom.
-    const double armX = c.sx(14.0), armY = c.sy(14.0);
+      // The band has no end along the direction, so the edges are drawn right
+      // across the frame and beyond -- a line that stopped would suggest a
+      // reach the force does not actually have.
+      const double reach = std::sqrt(c.width() * c.width() + c.height() * c.height());
+
+      setColour(c, kRing);
+      for (int s = -1; s <= 1; s += 2) {
+        const double ox = px * half * s, oy = py * half * s;
+        line(c, p.x + ox - dx * reach, p.y + oy - dy * reach, p.x + ox + dx * reach,
+             p.y + oy + dy * reach);
+      }
+      // Centre line, where the force is strongest.
+      setColour(c, col);
+      line(c, p.x - dx * reach, p.y - dy * reach, p.x + dx * reach, p.y + dy * reach);
+
+      // Arrow along the direction, so which way it blows is unambiguous.
+      const double aLen = c.sx(kDirHandleDist);
+      const double tipX = p.x + dx * aLen, tipY = p.y + dy * aLen;
+      const double headX = c.sx(10.0), headY = c.sy(10.0);
+      setColour(c, kShadow);
+      c.draw->setLineWidth(c.ctx, 3.0f);
+      line(c, p.x, p.y, tipX, tipY);
+      setColour(c, col);
+      c.draw->setLineWidth(c.ctx, 1.0f);
+      line(c, p.x, p.y, tipX, tipY);
+      line(c, tipX, tipY, tipX - dx * headX + px * headX * 0.6,
+           tipY - dy * headY + py * headY * 0.6);
+      line(c, tipX, tipY, tipX - dx * headX - px * headX * 0.6,
+           tipY - dy * headY - py * headY * 0.6);
+
+      handle(c, p.x, p.y, col);
+      handle(c, tipX, tipY, col, 4.0);                              // rotate
+      handle(c, p.x + px * half, p.y + py * half, col, 4.0);        // width
+    } else {
+      const double r = f.radius * c.width();
+
+      // Reach of the force. Everything outside this circle is untouched by it,
+      // so it is the single most useful thing the overlay can show.
+      setColour(c, kRing);
+      ellipse(c, p.x, p.y, r, r);
+      setColour(c, col);
+      ellipse(c, p.x, p.y, r * 0.5, r * 0.5);
+
+      // Crosshair, sized in screen pixels so it stays findable at any zoom.
+      const double armX = c.sx(14.0), armY = c.sy(14.0);
+      setColour(c, kShadow);
+      c.draw->setLineWidth(c.ctx, 3.0f);
+      line(c, p.x - armX, p.y, p.x + armX, p.y);
+      line(c, p.x, p.y - armY, p.x, p.y + armY);
+      setColour(c, col);
+      c.draw->setLineWidth(c.ctx, 1.0f);
+      line(c, p.x - armX, p.y, p.x + armX, p.y);
+      line(c, p.x, p.y - armY, p.x, p.y + armY);
+
+      handle(c, p.x, p.y, col);
+      handle(c, p.x + r, p.y, col, 4.0);  // drag this to change the radius
+    }
+
+    // A negative strength pulls inward and a delay means nothing happens yet --
+    // both invisible from the geometry alone, so they go in the label rather
+    // than being left to surprise.
+    std::string label = std::string(name) + (f.strength < 0.0 ? "  pull " : "  push ") +
+                        trimNum(std::fabs(f.strength), 2);
+    if (f.delay > 0.0) label += "  +" + trimNum(f.delay, 0) + "f";
+
     setColour(c, kShadow);
-    c.draw->setLineWidth(c.ctx, 3.0f);
-    line(c, p.x - armX, p.y, p.x + armX, p.y);
-    line(c, p.x, p.y - armY, p.x, p.y + armY);
-    setColour(c, col);
-    c.draw->setLineWidth(c.ctx, 1.0f);
-    line(c, p.x - armX, p.y, p.x + armX, p.y);
-    line(c, p.x, p.y - armY, p.x, p.y + armY);
-
-    handle(c, p.x, p.y, col);
-    handle(c, p.x + r, p.y, col, 4.0);  // drag this to change the radius
-
-    // A negative strength pulls inward, which is invisible from the geometry
-    // alone -- so it goes in the label rather than being left to surprise.
-    const std::string sign = f.strength < 0.0 ? "  pull " : "  push ";
-    setColour(c, kShadow);
-    text(c, std::string(name) + sign + trimNum(std::fabs(f.strength), 2),
-         p.x + c.sx(13.0), p.y + c.sy(11.0));
+    text(c, label, p.x + c.sx(13.0), p.y + c.sy(11.0));
     setColour(c, kLabel);
-    text(c, std::string(name) + sign + trimNum(std::fabs(f.strength), 2),
-         p.x + c.sx(12.0), p.y + c.sy(12.0));
+    text(c, label, p.x + c.sx(12.0), p.y + c.sy(12.0));
   }
 
   // Snapshots the viewport for one event. Never throws: an exception escaping
@@ -338,6 +626,10 @@ class ForceInteract : public OFX::OverlayInteract {
   OFX::ImageEffect* _effect = nullptr;
   Grab _grab = Grab::None;
   int _which = 0;
+
+  Slice _pending;         ///< the cut being dragged, not yet committed
+  int _sliceIndex = -1;
+  int _sliceEnd = 0;
 };
 
 // Wraps the Support library's interact entry so the draw context, which only

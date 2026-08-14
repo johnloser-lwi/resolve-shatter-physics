@@ -115,6 +115,7 @@ void World::reset(const std::vector<Shard>& shards, const ForceParams& fp,
   _bodies.clear();
   _bodies.resize(shards.size());
   _contacts.clear();
+  _time = float(fp.startFrame);
 
   for (std::size_t i = 0; i < shards.size(); ++i) {
     const Shard& sh = shards[i];
@@ -153,11 +154,16 @@ void World::reset(const std::vector<Shard>& shards, const ForceParams& fp,
     b.invMassFull = 1.0f / std::max(0.0001f, mass);
     b.invInertiaFull = inertia > 1e-6f ? 1.0f / inertia : 0.0f;
 
-    // Launch state, computed here so activateDue does not need the force
-    // parameters again. Velocity sits on the body while it is still immovable
-    // and simply takes effect the moment it is released.
-    b.vel = InitialVelocity(ss, fp, pp, fs, id, mass);
-    b.w = InitialSpin(ss, fp, pp, fs, id, mass);
+    // The forces that will reach this shard, in the order they arrive. They are
+    // NOT folded into a launch velocity: a delayed force has to act on a piece
+    // that is already moving, which is the whole reason the delay control is
+    // interesting. Velocity therefore starts at zero and is built up by
+    // impulses as they fall due.
+    b.vel = Vec2(0.0f, 0.0f);
+    b.w = 0.0f;
+    b.pendingCount = GatherImpulses(ss, fp, pp, fs, id, mass, b.pending);
+    b.pendingNext = 0;
+    b.spinAtDetach = InitialSpin(ss, fp, pp, fs, id, mass);
 
     // Every piece starts immovable, and stays that way until its detach frame.
     //
@@ -173,13 +179,29 @@ void World::reset(const std::vector<Shard>& shards, const ForceParams& fp,
   }
 }
 
-void World::activateDue(float frame) {
+void World::releaseDue(float now) {
   for (Body& b : _bodies) {
-    if (b.active || b.culled) continue;
-    if (frame + 1e-4f < b.detachFrame) continue;
-    b.active = true;
-    b.invMass = b.invMassFull;
-    b.invInertia = b.invInertiaFull;
+    if (b.culled) continue;
+
+    // Let go, if it is time. A piece can be released before any force reaches
+    // it -- All At Once does exactly that -- in which case it simply starts
+    // falling and waits for its shove.
+    if (!b.active && now + 1e-4f >= b.detachFrame) {
+      b.active = true;
+      b.invMass = b.invMassFull;
+      b.invInertia = b.invInertiaFull;
+      b.w += b.spinAtDetach;
+    }
+    if (!b.active) continue;
+
+    // Impulses that have come due. Applied to velocity directly rather than
+    // through the contact solver: a force is an instantaneous change of motion,
+    // not something the solver should be allowed to argue with.
+    while (b.pendingNext < b.pendingCount &&
+           b.pending[b.pendingNext].time <= now + 1e-4f) {
+      b.vel += b.pending[b.pendingNext].linear;
+      ++b.pendingNext;
+    }
   }
 }
 
@@ -510,12 +532,19 @@ void World::solveContacts(float dt) {
 }
 
 void World::step(float frame) {
-  activateDue(frame);
-
   const int n = _params.substeps;
   const float dt = 1.0f / float(n);
 
+  // The frame being stepped into ends at `frame`, so the substeps run over
+  // (frame-1, frame]. Releases and impulses are resolved at substep resolution
+  // rather than once per frame, so a delay of 10.5 frames lands where it says
+  // it does instead of snapping to the frame boundary.
+  _time = frame - 1.0f;
+
   for (int s = 0; s < n; ++s) {
+    _time += dt;
+    releaseDue(_time);
+
     integrate(dt);
 
     _contacts.clear();
@@ -523,6 +552,7 @@ void World::step(float frame) {
     collectShardContacts();
     solveContacts(dt);
   }
+  _time = frame;
 }
 
 }  // namespace phys

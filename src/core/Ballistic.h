@@ -116,19 +116,65 @@ inline void EvaluateBallistic(const std::vector<Shard>& shards, const ForceParam
     ss.inertiaPerMass = sh.inertiaPerMass;
 
     const float detach = DetachFrame(ss, fp, fs);
-    const float age = t - detach;
-    if (age < 0.0f) continue;   // still at rest: pose stays all-zero, active false
+    if (t < detach) continue;   // still at rest: pose stays all-zero, active false
 
     const uint32_t id = uint32_t(sh.id);
     const float mass = MassOf(ss, fs, pp, id, uint32_t(fp.seed));
-    const Vec2 v0 = InitialVelocity(ss, fp, pp, fs, id, mass);
     const float w0 = InitialSpin(ss, fp, pp, fs, id, mass);
 
-    Vec2 pos, vel;
-    IntegrateDrag(v0, g, drag, age, pos, vel);
+    ForceImpulse imp[2];
+    const int nImp = GatherImpulses(ss, fp, pp, fs, id, mass, imp);
 
-    float angle = 0.0f, w = 0.0f;
-    IntegrateSpin(w0, drag, age, angle, w);
+    // Walk the shard's own timeline: integrate up to each impulse, add it, carry
+    // on. With at most two forces this is at most three segments, and it stays
+    // closed-form throughout -- which is what keeps the mode evaluable at any
+    // frame in any order.
+    //
+    // A single blended launch velocity would be wrong here in a way that is easy
+    // to miss: a force arriving at frame 20 must act on a piece that has already
+    // been falling for 20 frames, not change how it left at frame 0.
+    Vec2 pos(0.0f, 0.0f);
+    Vec2 vel(0.0f, 0.0f);
+    float angle = 0.0f;
+    float w = 0.0f;
+    float cursor = detach;
+
+    // Spin is granted once, when the piece lets go, rather than per impulse.
+    // Rotation Speed reads as a property of the shatter, not of each blast, and
+    // handing every force its own spin makes a two-force setup tumble twice as
+    // fast for no reason the controls explain.
+    w = w0;
+
+    for (int e = 0; e < nImp; ++e) {
+      if (imp[e].time > t) break;
+      const float dt = imp[e].time - cursor;
+      if (dt > 0.0f) {
+        Vec2 dp, nv;
+        IntegrateDrag(vel, g, drag, dt, dp, nv);
+        pos += dp;
+        vel = nv;
+
+        float da = 0.0f, nw = 0.0f;
+        IntegrateSpin(w, drag, dt, da, nw);
+        angle += da;
+        w = nw;
+        cursor = imp[e].time;
+      }
+      vel += imp[e].linear;
+    }
+
+    const float tail = t - cursor;
+    if (tail > 0.0f) {
+      Vec2 dp, nv;
+      IntegrateDrag(vel, g, drag, tail, dp, nv);
+      pos += dp;
+      vel = nv;
+
+      float da = 0.0f, nw = 0.0f;
+      IntegrateSpin(w, drag, tail, da, nw);
+      angle += da;
+      w = nw;
+    }
 
     p.active = true;
     p.x = pos.x;
@@ -137,7 +183,7 @@ inline void EvaluateBallistic(const std::vector<Shard>& shards, const ForceParam
     p.vy = vel.y;
     p.angle = angle;
     p.w = w;
-    ApplyFade(age, rp.fadeStart, rp.fadeDuration, rp.shrinkOnFade, p.alpha, p.scale);
+    ApplyFade(t - detach, rp.fadeStart, rp.fadeDuration, rp.shrinkOnFade, p.alpha, p.scale);
   }
 }
 

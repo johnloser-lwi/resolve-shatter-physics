@@ -11,6 +11,7 @@
 #include "Physics2D.h"
 #include "Segmentation.h"
 #include "SimCache.h"
+#include "SliceList.h"
 
 #include <cmath>
 #include <cstdio>
@@ -261,6 +262,241 @@ void testRigidDeterminism() {
   std::vector<shp::ShardPose> fresh;
   c3.getPoses(geom, fp, pp, rp, fs, 40.0f, fresh);
   check(posesIdentical(straight, fresh), "rigid: a rebuilt cache reproduces the run");
+}
+
+// A directional force pushes every piece the SAME way, unlike a radial one
+// which pushes each piece away from a point. If the two ever collapse into the
+// same behaviour, this is what notices.
+void testDirectionalForce() {
+  const TestImage img = makeDiscs();
+  shp::ShapeParams sp;
+  sp.pattern = shp::Pattern::Voronoi;
+  sp.cellCount = 80;
+  auto geom = shp::buildGeometry(img.view(), nullptr, sp);
+  const shp::FrameScale fs = scaleOf(*geom);
+
+  shp::PhysicsParams pp;
+  pp.gravity = 0.0f;      // isolate the force
+  pp.randomness = 0.0f;   // and its direction
+  shp::RenderParams rp;
+
+  shp::ForceParams fp;
+  fp.f1.enabled = true;
+  fp.f1.shape = shp::ForceShape::Directional;
+  fp.f1.direction = 90.0f;  // to the right
+  fp.f1.width = 4.0f;       // wide enough to cover the whole frame
+  fp.f1.strength = 1.0f;
+
+  std::vector<shp::ShardPose> poses;
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, 10.0f, poses);
+
+  bool allRight = true;
+  int moved = 0;
+  for (const shp::ShardPose& p : poses) {
+    if (!p.active) continue;
+    if (p.x <= 0.0f) allRight = false;
+    if (std::fabs(p.y) > std::fabs(p.x) * 0.05f) allRight = false;  // essentially no drift
+    ++moved;
+  }
+  check(moved > 0 && allRight, "directional force moves every piece the same way");
+
+  // A narrow band must leave pieces outside it alone. Aimed across the frame
+  // through the middle, the discs at top-left and bottom-right fall outside.
+  fp.f1.width = 0.06f;
+  fp.f1.posY = 0.5f;
+  fp.mode = shp::ForceMode::InsideRadius;  // so untouched pieces never detach
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, 10.0f, poses);
+
+  int active = 0;
+  for (const shp::ShardPose& p : poses)
+    if (p.active) ++active;
+  check(active > 0 && active < int(poses.size()),
+        "a narrow band moves some pieces and leaves the rest standing");
+}
+
+// A delayed force must act on pieces that are ALREADY MOVING, not be averaged
+// into how they left. The two are easy to confuse and look completely different.
+void testForceDelay() {
+  const TestImage img = makeDiscs();
+  shp::ShapeParams sp;
+  sp.pattern = shp::Pattern::Voronoi;
+  sp.cellCount = 60;
+  auto geom = shp::buildGeometry(img.view(), nullptr, sp);
+  const shp::FrameScale fs = scaleOf(*geom);
+
+  shp::PhysicsParams pp;
+  pp.gravity = 0.0f;
+  pp.randomness = 0.0f;
+  pp.viscosity = 0.0f;
+  shp::RenderParams rp;
+
+  shp::ForceParams fp;
+  fp.f1.enabled = true;
+  fp.f1.shape = shp::ForceShape::Directional;
+  fp.f1.direction = 90.0f;
+  fp.f1.width = 4.0f;
+  fp.f1.strength = 1.0f;
+  fp.f1.delay = 10.0f;
+
+  std::vector<shp::ShardPose> before, after;
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, 5.0f, before);
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, 15.0f, after);
+
+  // Nothing has been pushed yet at frame 5 -- with gravity off, nothing has
+  // moved at all, even though the pieces have detached.
+  bool stillAtRest = true;
+  for (const shp::ShardPose& p : before)
+    if (std::fabs(p.x) > 1e-3f || std::fabs(p.y) > 1e-3f) stillAtRest = false;
+  check(stillAtRest, "a delayed force has not fired yet before its delay");
+
+  bool movedAfter = false;
+  for (const shp::ShardPose& p : after)
+    if (p.x > 1.0f) movedAfter = true;
+  check(movedAfter, "a delayed force fires once its delay has passed");
+
+  // The second force must add to the motion of a piece already in flight, so
+  // arriving later still produces MORE displacement than never arriving.
+  shp::ForceParams two = fp;
+  two.f1.delay = 0.0f;
+  two.f2 = two.f1;
+  two.f2.delay = 8.0f;
+
+  std::vector<shp::ShardPose> one, both;
+  shp::ForceParams justOne = two;
+  justOne.f2.enabled = false;
+  shp::EvaluateBallistic(geom->shards, justOne, pp, rp, fs, 20.0f, one);
+  shp::EvaluateBallistic(geom->shards, two, pp, rp, fs, 20.0f, both);
+
+  double sumOne = 0.0, sumBoth = 0.0;
+  for (std::size_t i = 0; i < one.size(); ++i) {
+    sumOne += double(one[i].x);
+    sumBoth += double(both[i].x);
+  }
+  check(sumBoth > sumOne * 1.2, "a delayed second force adds to a piece already in flight");
+
+  // And the rigid-body path has to agree that a delay is a delay.
+  //
+  // Inside Radius Only deliberately, so the pieces stay immovable until the
+  // force actually arrives. Under All At Once they detach on the start frame
+  // and adjacent hulls immediately push each other apart -- correct physics,
+  // but it means "has not moved" is not the thing being measured.
+  sp.buildPolygons = true;
+  auto rgeom = shp::buildGeometry(img.view(), nullptr, sp);
+  const shp::FrameScale rfs = scaleOf(*rgeom);
+
+  shp::ForceParams rfp = fp;
+  rfp.mode = shp::ForceMode::InsideRadius;
+
+  shp::SimCache sim;
+  std::vector<shp::ShardPose> rb, ra;
+  sim.getPoses(rgeom, rfp, pp, rp, rfs, 5.0f, rb);
+  sim.getPoses(rgeom, rfp, pp, rp, rfs, 15.0f, ra);
+
+  double moveBefore = 0.0, moveAfter = 0.0;
+  int activeBefore = 0;
+  for (const shp::ShardPose& p : rb) {
+    moveBefore += std::fabs(double(p.x));
+    if (p.active) ++activeBefore;
+  }
+  for (const shp::ShardPose& p : ra) moveAfter += std::fabs(double(p.x));
+
+  char buf[160];
+  std::snprintf(buf, sizeof(buf),
+                "rigid body honours the force delay (active@5=%d, move@5=%.2f, move@15=%.1f)",
+                activeBefore, moveBefore, moveAfter);
+  check(activeBefore == 0 && moveBefore < 1.0 && moveAfter > 10.0, buf);
+}
+
+// A cut that fully crosses a piece separates it; one that stops halfway does
+// not. That asymmetry is the whole behaviour of the slice tool.
+void testManualSlices() {
+  const TestImage img = makeDiscs();
+  shp::ShapeParams sp;
+  sp.pattern = shp::Pattern::Manual;
+
+  auto base = shp::buildGeometry(img.view(), nullptr, sp);
+  check(base->shards.size() == 3, "manual mode starts with whole objects");
+
+  // The first disc is centred near (60,60) with radius 34 in a 320x200 frame.
+  // A horizontal cut right across it should halve it and leave the others alone.
+  shp::Slice through;
+  through.x1 = 0.02f;
+  through.y1 = 60.0f / 200.0f;
+  through.x2 = 0.40f;
+  through.y2 = 60.0f / 200.0f;
+
+  sp.slices = {through};
+  auto cut = shp::buildGeometry(img.view(), nullptr, sp);
+  check(cut->shards.size() == 4, "a cut across a piece splits it in two");
+
+  // Nothing may be lost to the cut. The barrier pixels have to be handed back
+  // to a neighbour, or every slice would erase a hairline of the artwork.
+  std::size_t beforeCovered = 0, afterCovered = 0;
+  for (int32_t l : base->labelImage)
+    if (l != 0) ++beforeCovered;
+  for (int32_t l : cut->labelImage)
+    if (l != 0) ++afterCovered;
+  check(beforeCovered == afterCovered, "a cut separates without erasing any pixels");
+
+  // A stub that stops inside the disc must not separate anything.
+  shp::Slice stub;
+  stub.x1 = 0.02f;
+  stub.y1 = 60.0f / 200.0f;
+  stub.x2 = 0.10f;  // ends well short of the far edge
+  stub.y2 = 60.0f / 200.0f;
+
+  sp.slices = {stub};
+  auto partial = shp::buildGeometry(img.view(), nullptr, sp);
+  check(partial->shards.size() == 3, "a cut that stops halfway separates nothing");
+
+  // Cuts apply on top of a generated pattern, not instead of it.
+  sp.pattern = shp::Pattern::Voronoi;
+  sp.cellCount = 40;
+  sp.slices.clear();
+  auto plain = shp::buildGeometry(img.view(), nullptr, sp);
+  sp.slices = {through};
+  auto sliced = shp::buildGeometry(img.view(), nullptr, sp);
+  check(sliced->shards.size() > plain->shards.size(),
+        "cuts apply on top of a generated pattern");
+
+  // Diagonal cuts are the case a one-pixel barrier leaks through, because an
+  // 8-connected labeller steps diagonally too.
+  shp::Slice diag;
+  diag.x1 = 0.02f;
+  diag.y1 = 0.05f;
+  diag.x2 = 0.40f;
+  diag.y2 = 0.55f;
+  sp.pattern = shp::Pattern::Manual;
+  sp.slices = {diag};
+  auto diagonal = shp::buildGeometry(img.view(), nullptr, sp);
+  check(diagonal->shards.size() > 3, "a diagonal cut does not leak");
+}
+
+// The cut list is persisted as text, so it has to survive a round trip and it
+// has to tolerate being edited by hand.
+void testSliceListRoundTrip() {
+  std::vector<shp::Slice> in;
+  shp::Slice a;
+  a.x1 = 0.125f; a.y1 = 0.25f; a.x2 = 0.875f; a.y2 = 0.75f;
+  shp::Slice b;
+  b.x1 = -0.5f; b.y1 = 0.0f; b.x2 = 1.5f; b.y2 = 1.0f;
+  in.push_back(a);
+  in.push_back(b);
+
+  const std::vector<shp::Slice> out = shp::ParseSlices(shp::FormatSlices(in));
+  bool same = out.size() == in.size();
+  for (std::size_t i = 0; same && i < in.size(); ++i) {
+    if (std::fabs(out[i].x1 - in[i].x1) > 1e-4f) same = false;
+    if (std::fabs(out[i].y2 - in[i].y2) > 1e-4f) same = false;
+  }
+  check(same, "the cut list survives a write/read round trip");
+
+  // Half-typed input must not throw or invent a cut from a partial group.
+  check(shp::ParseSlices("0.1,0.2,0.3").empty(), "a partial cut is dropped, not guessed");
+  check(shp::ParseSlices("").empty(), "an empty cut list parses to nothing");
+  check(shp::ParseSlices("garbage").empty(), "unparseable text yields no cuts");
+  check(shp::ParseSlices("0.1 0.2 0.3 0.4  0.5 0.6 0.7 0.8").size() == 2,
+        "separators are lenient");
 }
 
 // Changing a render-only control must NOT invalidate the simulation, or every
@@ -518,6 +754,10 @@ int main() {
   testHullsAreValid();
   testBallisticDeterminism();
   testRigidDeterminism();
+  testDirectionalForce();
+  testForceDelay();
+  testManualSlices();
+  testSliceListRoundTrip();
   testFadeDoesNotInvalidateSim();
   testPiecesRestOnFloor();
   testRestFrameReproducesSource();

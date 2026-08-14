@@ -15,6 +15,7 @@
 #include "EditBlock.h"
 #include "ParamNames.h"
 #include "ParamRegistry.h"
+#include "SliceList.h"
 #include "core/Ballistic.h"
 #include "core/Cells.h"
 #include "core/Compositor.h"
@@ -145,15 +146,25 @@ class ShatterPhysicsPlugin : public OFX::ImageEffect {
     _minPieceArea = fetchDoubleParam(shp::kParamMinPieceArea);
     _bridgeRadius = fetchDoubleParam(shp::kParamBridgeRadius);
     _shapeSeed = fetchIntParam(shp::kParamShapeSeed);
+    _slices = fetchStringParam(shp::kParamSlices);
+    _sliceTool = fetchBooleanParam(shp::kParamSliceTool);
 
     _force1Enabled = fetchBooleanParam(shp::kParamForce1Enabled);
+    _force1Shape = fetchChoiceParam(shp::kParamForce1Shape);
     _force1Pos = fetchDouble2DParam(shp::kParamForce1Pos);
     _force1Radius = fetchDoubleParam(shp::kParamForce1Radius);
+    _force1Direction = fetchDoubleParam(shp::kParamForce1Direction);
+    _force1Width = fetchDoubleParam(shp::kParamForce1Width);
     _force1Strength = fetchDoubleParam(shp::kParamForce1Strength);
+    _force1Delay = fetchDoubleParam(shp::kParamForce1Delay);
     _force2Enabled = fetchBooleanParam(shp::kParamForce2Enabled);
+    _force2Shape = fetchChoiceParam(shp::kParamForce2Shape);
     _force2Pos = fetchDouble2DParam(shp::kParamForce2Pos);
     _force2Radius = fetchDoubleParam(shp::kParamForce2Radius);
+    _force2Direction = fetchDoubleParam(shp::kParamForce2Direction);
+    _force2Width = fetchDoubleParam(shp::kParamForce2Width);
     _force2Strength = fetchDoubleParam(shp::kParamForce2Strength);
+    _force2Delay = fetchDoubleParam(shp::kParamForce2Delay);
     _forceMode = fetchChoiceParam(shp::kParamForceMode);
     _waveSpeed = fetchDoubleParam(shp::kParamWaveSpeed);
     _falloff = fetchChoiceParam(shp::kParamFalloff);
@@ -228,15 +239,25 @@ class ShatterPhysicsPlugin : public OFX::ImageEffect {
   OFX::DoubleParam* _minPieceArea = nullptr;
   OFX::DoubleParam* _bridgeRadius = nullptr;
   OFX::IntParam* _shapeSeed = nullptr;
+  OFX::StringParam* _slices = nullptr;
+  OFX::BooleanParam* _sliceTool = nullptr;
 
   OFX::BooleanParam* _force1Enabled = nullptr;
+  OFX::ChoiceParam* _force1Shape = nullptr;
   OFX::Double2DParam* _force1Pos = nullptr;
   OFX::DoubleParam* _force1Radius = nullptr;
+  OFX::DoubleParam* _force1Direction = nullptr;
+  OFX::DoubleParam* _force1Width = nullptr;
   OFX::DoubleParam* _force1Strength = nullptr;
+  OFX::DoubleParam* _force1Delay = nullptr;
   OFX::BooleanParam* _force2Enabled = nullptr;
+  OFX::ChoiceParam* _force2Shape = nullptr;
   OFX::Double2DParam* _force2Pos = nullptr;
   OFX::DoubleParam* _force2Radius = nullptr;
+  OFX::DoubleParam* _force2Direction = nullptr;
+  OFX::DoubleParam* _force2Width = nullptr;
   OFX::DoubleParam* _force2Strength = nullptr;
+  OFX::DoubleParam* _force2Delay = nullptr;
   OFX::ChoiceParam* _forceMode = nullptr;
   OFX::DoubleParam* _waveSpeed = nullptr;
   OFX::ChoiceParam* _falloff = nullptr;
@@ -299,7 +320,7 @@ class ShatterPhysicsPlugin : public OFX::ImageEffect {
 
 shp::ShapeParams ShatterPhysicsPlugin::readShape(double t) const {
   shp::ShapeParams sp;
-  sp.pattern = shp::Pattern(choiceAt(_pattern, t, 0, 4));
+  sp.pattern = shp::Pattern(choiceAt(_pattern, t, 0, 5));
   _cellCount->getValueAtTime(t, sp.cellCount);
   double d = 0.0;
   _cellJitter->getValueAtTime(t, d);
@@ -318,6 +339,14 @@ shp::ShapeParams ShatterPhysicsPlugin::readShape(double t) const {
   sp.bridgeRadius = float(d * 0.01);
   _shapeSeed->getValueAtTime(t, sp.shapeSeed);
 
+  // Hand-drawn cuts apply on top of every pattern, not just Manual Slices, so
+  // a generated shatter can be corrected rather than replaced.
+  {
+    std::string s;
+    _slices->getValueAtTime(t, s);
+    sp.slices = shp::ParseSlices(s);
+  }
+
   // Collision hulls cost real time on a thousand-shard frame, and the ballistic
   // mode never looks at them.
   sp.buildPolygons = choiceAt(_simMode, t, 0, 1) == shp::kSimRigidBody;
@@ -328,23 +357,31 @@ shp::ForceParams ShatterPhysicsPlugin::readForces(double t) const {
   shp::ForceParams fp;
   double x = 0.0, y = 0.0, d = 0.0;
 
-  _force1Enabled->getValueAtTime(t, fp.f1.enabled);
-  _force1Pos->getValueAtTime(t, x, y);
-  fp.f1.posX = float(x);
-  fp.f1.posY = float(y);
-  _force1Radius->getValueAtTime(t, d);
-  fp.f1.radius = float(d);
-  _force1Strength->getValueAtTime(t, d);
-  fp.f1.strength = float(d);
+  auto readField = [&](shp::ForceField& f, OFX::BooleanParam* en, OFX::ChoiceParam* shape,
+                       OFX::Double2DParam* pos, OFX::DoubleParam* radius,
+                       OFX::DoubleParam* dir, OFX::DoubleParam* width,
+                       OFX::DoubleParam* strength, OFX::DoubleParam* delay) {
+    en->getValueAtTime(t, f.enabled);
+    f.shape = shp::ForceShape(choiceAt(shape, t, 0, 1));
+    pos->getValueAtTime(t, x, y);
+    f.posX = float(x);
+    f.posY = float(y);
+    radius->getValueAtTime(t, d);
+    f.radius = float(d);
+    dir->getValueAtTime(t, d);
+    f.direction = float(d);
+    width->getValueAtTime(t, d);
+    f.width = float(d);
+    strength->getValueAtTime(t, d);
+    f.strength = float(d);
+    delay->getValueAtTime(t, d);
+    f.delay = float(d);
+  };
 
-  _force2Enabled->getValueAtTime(t, fp.f2.enabled);
-  _force2Pos->getValueAtTime(t, x, y);
-  fp.f2.posX = float(x);
-  fp.f2.posY = float(y);
-  _force2Radius->getValueAtTime(t, d);
-  fp.f2.radius = float(d);
-  _force2Strength->getValueAtTime(t, d);
-  fp.f2.strength = float(d);
+  readField(fp.f1, _force1Enabled, _force1Shape, _force1Pos, _force1Radius, _force1Direction,
+            _force1Width, _force1Strength, _force1Delay);
+  readField(fp.f2, _force2Enabled, _force2Shape, _force2Pos, _force2Radius, _force2Direction,
+            _force2Width, _force2Strength, _force2Delay);
 
   fp.mode = shp::ForceMode(choiceAt(_forceMode, t, 0, 2));
   _waveSpeed->getValueAtTime(t, d);
@@ -402,7 +439,7 @@ shp::RenderParams ShatterPhysicsPlugin::readRender(double t) const {
 // ends up visible in one state and hidden in an equivalent one, depending on
 // which order the user happened to click things in.
 void ShatterPhysicsPlugin::syncVisibility() {
-  const int pattern = choiceAt(_pattern, 0.0, 0, 4);
+  const int pattern = choiceAt(_pattern, 0.0, 0, 5);
   const int mode = choiceAt(_forceMode, 0.0, 0, 2);
   const int sim = choiceAt(_simMode, 0.0, 0, 1);
 
@@ -417,6 +454,18 @@ void ShatterPhysicsPlugin::syncVisibility() {
   _mapLevels->setIsSecret(!map);
 
   _waveSpeed->setIsSecret(mode != shp::kForceRadialWave);
+
+  // Radius belongs to a radial force, direction and width to a directional one.
+  // Showing all three at once invites setting a width that does nothing.
+  const bool dir1 = choiceAt(_force1Shape, 0.0, 0, 1) == shp::kForceDirectional;
+  _force1Radius->setIsSecret(dir1);
+  _force1Direction->setIsSecret(!dir1);
+  _force1Width->setIsSecret(!dir1);
+
+  const bool dir2 = choiceAt(_force2Shape, 0.0, 0, 1) == shp::kForceDirectional;
+  _force2Radius->setIsSecret(dir2);
+  _force2Direction->setIsSecret(!dir2);
+  _force2Width->setIsSecret(!dir2);
 
   const bool rigid = sim == shp::kSimRigidBody;
   _bounciness->setIsSecret(!rigid);
@@ -444,9 +493,17 @@ void ShatterPhysicsPlugin::changedParam(const OFX::InstanceChangedArgs&,
   // A throw out of changedParam takes the host's parameter dispatch with it, so
   // nothing is allowed to escape.
   try {
+    if (name == shp::kParamClearSlices) {
+      // Bracketed so it is one undo step, and so Fusion is told the value moved
+      // -- without that it keeps serving frames cut with the old slices.
+      shp::EditBlock block(this, "Clear Cuts");
+      _slices->setValue("");
+      return;
+    }
     if (name == shp::kParamPattern || name == shp::kParamForceMode ||
         name == shp::kParamSimMode || name == shp::kParamFadeDuration ||
-        name == shp::kParamMotionBlur) {
+        name == shp::kParamMotionBlur || name == shp::kParamForce1Shape ||
+        name == shp::kParamForce2Shape) {
       syncVisibility();
     }
   } catch (...) {
@@ -828,8 +885,40 @@ void ShatterPhysicsFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
     p->appendOption("Grid");
     p->appendOption("Alpha Pieces");
     p->appendOption("Custom Map");
+    p->appendOption("Manual Slices");
     p->setDefault(shp::kPatternVoronoi);
     addParam(page, p, gShape);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam(shp::kParamSliceTool);
+    p->setLabels("Slice Tool", "Slice Tool", "Slice Tool");
+    p->setHint(
+        "Turn this on and drag across the viewer to cut. Each drag adds one "
+        "cut, which separates whatever it crosses all the way through -- a cut "
+        "that stops halfway through a piece does not split it, exactly like a "
+        "real knife. Drag the square handles at either end to adjust a cut "
+        "afterwards.\n\n"
+        "Cuts apply on top of whichever pattern is selected, so you can break "
+        "the frame automatically and then fix the two places it got wrong. "
+        "Choose the Manual Slices pattern to work from nothing but your own "
+        "cuts.");
+    p->setDefault(false);
+    addParamUI(page, p, gShape);  // a viewer mode, not a value the render reads
+  }
+  {
+    OFX::StringParamDescriptor* p = desc.defineStringParam(shp::kParamSlices);
+    p->setLabels("Cuts", "Cuts", "Cuts");
+    p->setHint(
+        "The cuts you have drawn, as x1,y1,x2,y2 in fractions of the frame. "
+        "Editable by hand, and safe to copy between clips.");
+    p->setDefault("");
+    addParam(page, p, gShape);
+  }
+  {
+    OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam(shp::kParamClearSlices);
+    p->setLabels("Clear Cuts", "Clear Cuts", "Clear Cuts");
+    p->setHint("Remove every hand-drawn cut. Undo brings them back.");
+    addParamUI(page, p, gShape);
   }
   {
     OFX::IntParamDescriptor* p = desc.defineIntParam(shp::kParamCellCount);
@@ -966,17 +1055,24 @@ void ShatterPhysicsFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
 
   struct ForceDef {
     const char* enabled;
+    const char* shape;
     const char* pos;
     const char* radius;
+    const char* direction;
+    const char* width;
     const char* strength;
+    const char* delay;
     const char* label;
     bool on;
+    double defaultDelay;
   };
   const ForceDef forces[2] = {
-      {shp::kParamForce1Enabled, shp::kParamForce1Pos, shp::kParamForce1Radius,
-       shp::kParamForce1Strength, "Force 1", true},
-      {shp::kParamForce2Enabled, shp::kParamForce2Pos, shp::kParamForce2Radius,
-       shp::kParamForce2Strength, "Force 2", false},
+      {shp::kParamForce1Enabled, shp::kParamForce1Shape, shp::kParamForce1Pos,
+       shp::kParamForce1Radius, shp::kParamForce1Direction, shp::kParamForce1Width,
+       shp::kParamForce1Strength, shp::kParamForce1Delay, "Force 1", true, 0.0},
+      {shp::kParamForce2Enabled, shp::kParamForce2Shape, shp::kParamForce2Pos,
+       shp::kParamForce2Radius, shp::kParamForce2Direction, shp::kParamForce2Width,
+       shp::kParamForce2Strength, shp::kParamForce2Delay, "Force 2", false, 12.0},
   };
 
   for (const ForceDef& f : forces) {
@@ -988,9 +1084,25 @@ void ShatterPhysicsFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
       addParam(page, p, gForce);
     }
     {
+      OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam(f.shape);
+      p->setLabels("  Shape", "Shape", "Force Shape");
+      p->setHint(
+          "Radial blows outward from a point and fades with distance from it. "
+          "Directional blows along an angle and fades with distance from the "
+          "line -- its reach along that line is unlimited, so it behaves like "
+          "wind rather than like a blast.");
+      p->appendOption("Radial");
+      p->appendOption("Directional");
+      p->setDefault(shp::kForceRadial);
+      addParam(page, p, gForce);
+    }
+    {
       OFX::Double2DParamDescriptor* p = desc.defineDouble2DParam(f.pos);
       p->setLabels("  Position", "Position", "Position");
-      p->setHint("Where the blast comes from, as a fraction of the frame.");
+      p->setHint(
+          "Where the blast comes from, as a fraction of the frame. For a "
+          "directional force this is a point on its centre line -- moving it "
+          "along the direction changes nothing, moving it across shifts the band.");
       p->setDoubleType(OFX::eDoubleTypePlain);
       p->setRange(-5.0, -5.0, 5.0, 5.0);
       p->setDisplayRange(0.0, 0.0, 1.0, 1.0);
@@ -1007,12 +1119,49 @@ void ShatterPhysicsFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
       addParam(page, p, gForce);
     }
     {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam(f.direction);
+      p->setLabels("  Direction", "Direction", "Direction");
+      p->setHint(
+          "Which way it blows, in degrees. Same convention as gravity: 180 is "
+          "down, 0 is up, 90 is to the right.");
+      p->setRange(-3600.0, 3600.0);
+      p->setDisplayRange(0.0, 360.0);
+      p->setDefault(90.0);
+      addParam(page, p, gForce);
+    }
+    {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam(f.width);
+      p->setLabels("  Width", "Width", "Width");
+      p->setHint(
+          "How wide the band of moving air is, across the direction, as a "
+          "fraction of frame width. Pieces near the centre line are thrown "
+          "hardest; past the edge nothing moves.");
+      p->setRange(0.0, 10.0);
+      p->setDisplayRange(0.02, 2.0);
+      p->setDefault(0.5);
+      addParam(page, p, gForce);
+    }
+    {
       OFX::DoubleParamDescriptor* p = desc.defineDoubleParam(f.strength);
       p->setLabels("  Strength", "Strength", "Strength");
       p->setHint("How hard it throws. Negative pulls pieces inward instead.");
       p->setRange(-100.0, 100.0);
       p->setDisplayRange(-3.0, 5.0);
       p->setDefault(1.0);
+      addParam(page, p, gForce);
+    }
+    {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam(f.delay);
+      p->setLabels("  Delay (frames)", "Delay", "Delay (frames)");
+      p->setHint(
+          "How long after the start frame this force fires. A delayed force "
+          "arrives while the pieces are already in the air and shoves them "
+          "again, which is a different look from two forces going off together "
+          "-- try breaking the frame with one and sweeping it sideways with the "
+          "other a few frames later.");
+      p->setRange(0.0, 100000.0);
+      p->setDisplayRange(0.0, 60.0);
+      p->setDefault(f.defaultDelay);
       addParam(page, p, gForce);
     }
   }
