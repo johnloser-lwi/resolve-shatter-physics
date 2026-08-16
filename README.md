@@ -226,6 +226,47 @@ moving piece every substep. Type an exact angle there if dragging the handle is
 not precise enough. Changing any of it — the shape or the angle alone included —
 rebuilds the cached simulation.
 
+### Depth (3D Look)
+
+Not a 3D environment — an illusion of one. The simulation stays completely flat:
+forces, gravity, collisions and the solver all work in the plane, which is what
+keeps the rigid-body mode tractable and the ballistic mode closed-form. What gets
+added is a per-piece z that nothing collides against and only the compositor
+reads.
+
+That buys three of the four cues an eye actually uses for depth — perspective,
+occlusion, and aerial haze. The fourth, binocular disparity, is unavailable on a
+flat screen anyway. The remaining giveaway is that each piece is a flat cutout,
+which is what **Edge Shading** and **Tumble** are for.
+
+Everything here defaults to **0**. Turning it on is three sliders:
+
+| Control | What it does |
+|---|---|
+| Depth Spread | Master switch. Throws pieces toward and away from camera as well as across frame, scaled by how hard each was actually thrown |
+| Toward / Away | Biases everything one way regardless of the forces — recede or come at you |
+| Perspective | How strongly depth changes size. 0 is orthographic, and depth still decides what covers what |
+| Distance Fade | Darkens pieces as they recede |
+| Tumble | Flips pieces end-over-end as well as spinning them flat, so they narrow to an edge and open out again |
+| Edge Shading | Lights a band along every cut edge, bright toward the light and dark away, so pieces read as having thickness |
+| Edge Width | How thick they look, as a percentage of frame height. Wide is masonry, narrow is glass |
+| Light Angle | Same convention as Gravity Direction; 180 is from directly above |
+
+A reasonable starting recipe: **Depth Spread 1.0, Perspective 0.9, Distance Fade
+0.45, Tumble 1.1, Edge Shading 1.1**.
+
+**Edge Shading is the one that does the most work**, and it works with everything
+else at 0. Note that it only shows on both sides where the artwork has tone to
+spare — on pure white, the lit side clips and you see only the shadow.
+
+Occlusion comes free: the draw list is sorted furthest-first before it is binned,
+so nearer pieces cover farther ones. Ties break on piece id, because before the
+shatter starts every piece sits at z = 0 and an unstable order there flickers
+wherever two pieces overlap by a pixel.
+
+Depth is applied *after* the simulation, like the fade, so changing any of it
+never invalidates a cached rigid-body run.
+
 ### Render
 
 Fade Out (0 means pieces never fade), Shrink While Fading, Smooth Edges, Motion
@@ -475,6 +516,19 @@ Forgetting the hash means changing a shape silently keeps the old simulation;
 forgetting the copy means every obstacle becomes whatever the struct's default
 is. Neither produces an error, and both look like a physics bug. Note that the
 copy loop scales coordinates to pixels but must NOT scale the angle.
+
+**In a vector distance transform, the distances being right is no evidence the
+directions are.** `EdgeField` propagates an offset from each pixel to its nearest
+edge, and the step added at each neighbour is the vector FROM that neighbour TO
+this pixel. Four of the eight had the wrong sign at first: the offset *lengths*
+were unaffected, so every distance assertion passed, while the stored normals
+came out backwards wherever those neighbours won — lighting some bevels from the
+wrong side. That reads as a lighting preference, not a bug. Test the direction
+explicitly.
+
+Related: the offset accumulates as steps taken *away* from a seed, so it already
+points from the edge into the piece. It is the inward normal as stored and must
+not be negated.
 
 **A rotated box stores its corners unrotated**, and applies the angle only when
 drawing or when building the collision hull. Two consequences, both of which

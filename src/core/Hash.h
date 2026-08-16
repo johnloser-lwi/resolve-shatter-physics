@@ -94,6 +94,9 @@ enum HashChannel : uint32_t {
     kChanSeedY      = 0x07,
     kChanTint       = 0x08,
     kChanDetach     = 0x09,
+    kChanDepth      = 0x0A,
+    kChanTumbleAxis = 0x0B,
+    kChanTumbleRate = 0x0C,
 };
 
 }  // namespace shp

@@ -28,6 +28,9 @@ int g_failures = 0;
 /// says so at the call site rather than leaving a bare `{}` to be puzzled over.
 const std::vector<shp::Collider> noColliders;
 
+/// Depth is off in most tests; naming it says so at the call site.
+const shp::DepthParams noDepth;
+
 struct Vec2Like {
   float x, y;
 };
@@ -215,19 +218,19 @@ void testBallisticDeterminism() {
   shp::RenderParams rp;
 
   std::vector<shp::ShardPose> a, b;
-  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, 17.0f, a);
-  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, 17.0f, b);
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, noDepth, 17.0f, a);
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, noDepth, 17.0f, b);
   check(posesIdentical(a, b), "ballistic: same inputs give bit-identical poses");
 
   // Evaluating an earlier frame in between must change nothing about frame 17.
   std::vector<shp::ShardPose> mid;
-  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, 3.0f, mid);
-  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, 17.0f, b);
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, noDepth, 3.0f, mid);
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, noDepth, 17.0f, b);
   check(posesIdentical(a, b), "ballistic: evaluation order does not matter");
 
   // A different motion seed must actually change the motion.
   fp.seed = 99;
-  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, 17.0f, b);
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, noDepth, 17.0f, b);
   check(!posesIdentical(a, b), "ballistic: the motion seed changes the motion");
 }
 
@@ -251,25 +254,25 @@ void testRigidDeterminism() {
   // Forward, straight to frame 40.
   shp::SimCache c1;
   std::vector<shp::ShardPose> straight;
-  c1.getPoses(geom, fp, pp, rp, fs, noColliders, 40.0f, straight);
+  c1.getPoses(geom, fp, pp, rp, fs, noDepth, noColliders, 40.0f, straight);
 
   // A separate cache walked one frame at a time to the same place.
   shp::SimCache c2;
   std::vector<shp::ShardPose> walked;
-  for (int f = 1; f <= 40; ++f) c2.getPoses(geom, fp, pp, rp, fs, noColliders, float(f), walked);
+  for (int f = 1; f <= 40; ++f) c2.getPoses(geom, fp, pp, rp, fs, noDepth, noColliders, float(f), walked);
   check(posesIdentical(straight, walked), "rigid: stepping there equals jumping there");
 
   // Scrub backward then forward again on the SAME cache: the backward lookup
   // must not disturb the stored timeline.
   std::vector<shp::ShardPose> back, again;
-  c1.getPoses(geom, fp, pp, rp, fs, noColliders, 5.0f, back);
-  c1.getPoses(geom, fp, pp, rp, fs, noColliders, 40.0f, again);
+  c1.getPoses(geom, fp, pp, rp, fs, noDepth, noColliders, 5.0f, back);
+  c1.getPoses(geom, fp, pp, rp, fs, noDepth, noColliders, 40.0f, again);
   check(posesIdentical(straight, again), "rigid: scrubbing backward does not corrupt the run");
 
   // A fresh cache with the same inputs reproduces the run exactly.
   shp::SimCache c3;
   std::vector<shp::ShardPose> fresh;
-  c3.getPoses(geom, fp, pp, rp, fs, noColliders, 40.0f, fresh);
+  c3.getPoses(geom, fp, pp, rp, fs, noDepth, noColliders, 40.0f, fresh);
   check(posesIdentical(straight, fresh), "rigid: a rebuilt cache reproduces the run");
 }
 
@@ -297,7 +300,7 @@ void testDirectionalForce() {
   fp.f1.strength = 1.0f;
 
   std::vector<shp::ShardPose> poses;
-  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, 10.0f, poses);
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, noDepth, 10.0f, poses);
 
   bool allRight = true;
   int moved = 0;
@@ -314,7 +317,7 @@ void testDirectionalForce() {
   fp.f1.width = 0.06f;
   fp.f1.posY = 0.5f;
   fp.mode = shp::ForceMode::InsideRadius;  // so untouched pieces never detach
-  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, 10.0f, poses);
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, noDepth, 10.0f, poses);
 
   int active = 0;
   for (const shp::ShardPose& p : poses)
@@ -348,8 +351,8 @@ void testForceDelay() {
   fp.f1.delay = 10.0f;
 
   std::vector<shp::ShardPose> before, after;
-  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, 5.0f, before);
-  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, 15.0f, after);
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, noDepth, 5.0f, before);
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, noDepth, 15.0f, after);
 
   // Nothing has been pushed yet at frame 5 -- with gravity off, nothing has
   // moved at all, even though the pieces have detached.
@@ -373,8 +376,8 @@ void testForceDelay() {
   std::vector<shp::ShardPose> one, both;
   shp::ForceParams justOne = two;
   justOne.f2.enabled = false;
-  shp::EvaluateBallistic(geom->shards, justOne, pp, rp, fs, 20.0f, one);
-  shp::EvaluateBallistic(geom->shards, two, pp, rp, fs, 20.0f, both);
+  shp::EvaluateBallistic(geom->shards, justOne, pp, rp, fs, noDepth, 20.0f, one);
+  shp::EvaluateBallistic(geom->shards, two, pp, rp, fs, noDepth, 20.0f, both);
 
   double sumOne = 0.0, sumBoth = 0.0;
   for (std::size_t i = 0; i < one.size(); ++i) {
@@ -398,8 +401,8 @@ void testForceDelay() {
 
   shp::SimCache sim;
   std::vector<shp::ShardPose> rb, ra;
-  sim.getPoses(rgeom, rfp, pp, rp, rfs, noColliders, 5.0f, rb);
-  sim.getPoses(rgeom, rfp, pp, rp, rfs, noColliders, 15.0f, ra);
+  sim.getPoses(rgeom, rfp, pp, rp, rfs, noDepth, noColliders, 5.0f, rb);
+  sim.getPoses(rgeom, rfp, pp, rp, rfs, noDepth, noColliders, 15.0f, ra);
 
   double moveBefore = 0.0, moveAfter = 0.0;
   int activeBefore = 0;
@@ -531,7 +534,7 @@ void testColliders() {
   // Without a shelf, everything falls out of the frame.
   shp::SimCache freefall;
   std::vector<shp::ShardPose> fell;
-  freefall.getPoses(geom, fp, pp, rp, fs, noColliders, 120.0f, fell);
+  freefall.getPoses(geom, fp, pp, rp, fs, noDepth, noColliders, 120.0f, fell);
 
   int belowFrame = 0;
   for (std::size_t i = 0; i < fell.size(); ++i)
@@ -551,7 +554,7 @@ void testColliders() {
 
   shp::SimCache caught;
   std::vector<shp::ShardPose> rest;
-  caught.getPoses(geom, fp, pp, rp, fs, shelf, 120.0f, rest);
+  caught.getPoses(geom, fp, pp, rp, fs, noDepth, shelf, 120.0f, rest);
 
   int held = 0;
   bool settled = true;
@@ -574,7 +577,7 @@ void testColliders() {
 
   shp::SimCache missed;
   std::vector<shp::ShardPose> past;
-  missed.getPoses(geom, fp, pp, rp, fs, stub, 120.0f, past);
+  missed.getPoses(geom, fp, pp, rp, fs, noDepth, stub, 120.0f, past);
 
   int through = 0;
   for (std::size_t i = 0; i < past.size(); ++i)
@@ -593,7 +596,7 @@ void testColliders() {
 
   shp::SimCache upward;
   std::vector<shp::ShardPose> hitCeiling;
-  upward.getPoses(geom, fp, up, rp, fs, ceiling, 120.0f, hitCeiling);
+  upward.getPoses(geom, fp, up, rp, fs, noDepth, ceiling, 120.0f, hitCeiling);
 
   int stopped = 0;
   for (std::size_t i = 0; i < hitCeiling.size(); ++i)
@@ -648,7 +651,7 @@ void testColliderShapes() {
 
   shp::SimCache boxSim;
   std::vector<shp::ShardPose> onBox;
-  boxSim.getPoses(geom, fp, pp, rp, fs, box, 120.0f, onBox);
+  boxSim.getPoses(geom, fp, pp, rp, fs, noDepth, box, 120.0f, onBox);
 
   const float boxTop = 0.95f * fs.height;
   int aboveBox = 0;
@@ -682,7 +685,7 @@ void testColliderShapes() {
   std::vector<shp::ShardPose> onDisc;
   int penetrations = 0;
   for (int frame = 10; frame <= 120; frame += 10) {
-    discSim.getPoses(geom, fp, pp, rp, fs, disc, float(frame), onDisc);
+    discSim.getPoses(geom, fp, pp, rp, fs, noDepth, disc, float(frame), onDisc);
     for (std::size_t i = 0; i < onDisc.size(); ++i) {
       const float cx = geom->shards[i].cx + onDisc[i].x;
       const float cy = geom->shards[i].cy + onDisc[i].y;
@@ -715,7 +718,7 @@ void testColliderShapes() {
 
   shp::SimCache rampSim;
   std::vector<shp::ShardPose> onRamp;
-  rampSim.getPoses(geom, fp, pp, rp, fs, ramp, 90.0f, onRamp);
+  rampSim.getPoses(geom, fp, pp, rp, fs, noDepth, ramp, 90.0f, onRamp);
 
   double drift = 0.0;
   for (const shp::ShardPose& p : onRamp) drift += double(p.x);
@@ -852,6 +855,161 @@ void testRotateHandle() {
         "a pointer exactly on the centre leaves the box upright");
 }
 
+// The depth illusion: size, occlusion order, aerial shading, and the edge field
+// that makes a flat cutout read as having thickness.
+void testDepth() {
+  const TestImage img = makeDiscs();
+  shp::ShapeParams sp;
+  sp.pattern = shp::Pattern::Voronoi;
+  sp.cellCount = 80;
+  auto geom = shp::buildGeometry(img.view(), nullptr, sp);
+  const shp::FrameScale fs = scaleOf(*geom);
+
+  shp::DepthParams dp;
+  dp.perspective = 0.5f;
+  dp.aerial = 0.5f;
+
+  // Nearer is bigger, further is smaller, and the plane is unchanged.
+  const float near = shp::PerspectiveScale(-200.0f, dp, fs);
+  const float flat = shp::PerspectiveScale(0.0f, dp, fs);
+  const float far = shp::PerspectiveScale(600.0f, dp, fs);
+  check(near > flat && flat > far, "perspective makes near pieces bigger and far ones smaller");
+  check(std::fabs(flat - 1.0f) < 1e-4f, "a piece at zero depth is unscaled");
+
+  // Even a piece that flies past the camera has to come out finite. The divide
+  // has a singularity behind the lens and NaN would spread to every pixel it
+  // touches.
+  const float past = shp::PerspectiveScale(-1e6f, dp, fs);
+  check(past == past && past > 0.0f && past <= 20.0f, "flying past the camera stays finite");
+
+  // Orthographic still sorts and shades, it just does not scale.
+  shp::DepthParams ortho = dp;
+  ortho.perspective = 0.0f;
+  check(std::fabs(shp::PerspectiveScale(500.0f, ortho, fs) - 1.0f) < 1e-6f,
+        "zero perspective leaves size alone");
+
+  check(shp::AerialShade(fs.width, dp, fs) < 1.0f, "distant pieces are shaded down");
+  check(std::fabs(shp::AerialShade(-500.0f, dp, fs) - 1.0f) < 1e-6f,
+        "aerial shading never brightens a near piece");
+
+  // Draw order must run far to near, or occlusion -- the strongest cue of the
+  // lot -- comes out backwards.
+  shp::ForceParams fp;
+  fp.f1.enabled = true;
+  shp::PhysicsParams pp;
+  shp::RenderParams rp;
+  shp::DepthParams spread = dp;
+  spread.spread = 1.2f;
+
+  std::vector<shp::ShardPose> poses;
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, spread, 14.0f, poses);
+
+  bool anyDepth = false;
+  for (const shp::ShardPose& p : poses)
+    if (std::fabs(p.z) > 1.0f) anyDepth = true;
+  check(anyDepth, "depth spread actually moves pieces in z");
+
+  std::vector<shp::ShardDraw> draws;
+  shp::BuildDrawList(*geom, poses, shp::BlurParams{}, spread, fs, draws);
+
+  bool sorted = true;
+  for (std::size_t i = 1; i < draws.size(); ++i)
+    if (draws[i].z > draws[i - 1].z + 1e-4f) sorted = false;
+  check(sorted, "the draw list is ordered furthest first");
+
+  // Ties must break deterministically. Before the shatter starts every piece
+  // sits at z = 0, and an unstable order there flickers wherever two pieces
+  // overlap.
+  std::vector<shp::ShardPose> rest;
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, spread, -5.0f, rest);
+  std::vector<shp::ShardDraw> a, b;
+  shp::BuildDrawList(*geom, rest, shp::BlurParams{}, spread, fs, a);
+  shp::BuildDrawList(*geom, rest, shp::BlurParams{}, spread, fs, b);
+  bool sameOrder = a.size() == b.size();
+  for (std::size_t i = 0; sameOrder && i < a.size(); ++i)
+    if (a[i].label != b[i].label) sameOrder = false;
+  check(sameOrder, "pieces at equal depth keep a stable order");
+
+  // Depth is applied after the simulation, so it must not be part of its key --
+  // otherwise every nudge to the perspective would re-run the physics.
+  const uint64_t before = shp::HashSimParams(fp, pp, noColliders);
+  check(before == shp::HashSimParams(fp, pp, noColliders), "the sim key ignores depth");
+}
+
+// The edge field is what the bevel reads. Wrong distances or wrong normals give
+// a shatter that looks embossed in the wrong direction, which is subtle enough
+// to be mistaken for a lighting preference.
+void testEdgeField() {
+  const TestImage img = makeDiscs();
+  shp::ShapeParams sp;
+  sp.pattern = shp::Pattern::Alpha;
+  sp.buildEdgeField = true;
+  auto geom = shp::buildGeometry(img.view(), nullptr, sp);
+
+  check(geom->edges.valid() && geom->edges.width == geom->width,
+        "the edge field is built when asked for");
+
+  // Not built unless asked: it is two more bytes per pixel.
+  shp::ShapeParams off = sp;
+  off.buildEdgeField = false;
+  auto plain = shp::buildGeometry(img.view(), nullptr, off);
+  check(!plain->edges.valid(), "the edge field is skipped when the bevel is off");
+
+  // The middle of the biggest disc is 44 pixels across, so its centre must be
+  // far from any edge, while a pixel on its rim must be at zero.
+  const int w = geom->width;
+  auto distAt = [&](int x, int y) {
+    return int(geom->edges.dist[std::size_t(y) * std::size_t(w) + std::size_t(x)]);
+  };
+  check(distAt(250, 140) > 30, "the middle of a piece is far from its edge");
+  check(distAt(250, 140 - 43) <= 2, "a pixel on the rim is at the edge");
+
+  // Distance must rise monotonically walking inward from the rim.
+  bool rises = true;
+  int prev = -1;
+  for (int y = 140 - 43; y <= 140; ++y) {
+    const int d = distAt(250, y);
+    if (d + 1 < prev) rises = false;   // allows the flat run at the centre
+    prev = d;
+  }
+  check(rises, "distance grows walking in from the edge");
+
+  // The stored normal points INWARD. On the top rim of a disc, inward is down
+  // the screen, which in this top-down space is +y.
+  const std::size_t rim = std::size_t(140 - 41) * std::size_t(w) + 250;
+  const float a = float(geom->edges.angle[rim]) * (2.0f * shp::kPi / 255.0f);
+  check(std::sin(a) > 0.5f, "the edge normal points into the piece");
+
+  // And the shading built on it: flat deep inside, and opposite on the two
+  // sides of a piece.
+  const uint8_t* d8 = geom->edges.dist.data();
+  const uint8_t* a8 = geom->edges.angle.data();
+  const float deep = shp::BevelShade(d8, a8, w, geom->height, 250, 140, 0.0f, 1.0f, 8.0f,
+                                     0.0f, 1.0f);
+  check(std::fabs(deep - 1.0f) < 1e-6f, "the middle of a piece is left unshaded");
+
+  const float top = shp::BevelShade(d8, a8, w, geom->height, 250, 140 - 41, 0.0f, 1.0f, 8.0f,
+                                    0.0f, 1.0f);
+  const float bottom = shp::BevelShade(d8, a8, w, geom->height, 250, 140 + 41, 0.0f, 1.0f,
+                                       8.0f, 0.0f, 1.0f);
+  char bmsg[160];
+  std::snprintf(bmsg, sizeof(bmsg),
+                "one edge lights and the opposite shadows (top %.3f d=%d, bottom %.3f d=%d)",
+                double(top), distAt(250, 140 - 41), double(bottom), distAt(250, 140 + 41));
+  check(top > 1.0f && bottom < 1.0f, bmsg);
+
+  // Zero strength must be exactly neutral, so the control genuinely switches off.
+  check(shp::BevelShade(d8, a8, w, geom->height, 250, 140 - 41, 0.0f, 0.0f, 8.0f, 0.0f,
+                        1.0f) == 1.0f,
+        "zero strength leaves the pixel alone");
+
+  // Rotating the piece must move the lighting across it, since the light is
+  // fixed in the world and the piece turns under it.
+  const float turned = shp::BevelShade(d8, a8, w, geom->height, 250, 140 - 41, shp::kPi, 1.0f,
+                                       8.0f, 0.0f, 1.0f);
+  check(turned < 1.0f, "turning a piece over swaps its lit and shadowed edges");
+}
+
 // Changing a render-only control must NOT invalidate the simulation, or every
 // fade tweak would re-run the physics.
 void testFadeDoesNotInvalidateSim() {
@@ -893,7 +1051,7 @@ void testPiecesRestOnFloor() {
 
   shp::SimCache sim;
   std::vector<shp::ShardPose> poses;
-  sim.getPoses(geom, fp, pp, rp, fs, noColliders, 200.0f, poses);
+  sim.getPoses(geom, fp, pp, rp, fs, noDepth, noColliders, 200.0f, poses);
 
   const float floorY = fs.height;
   bool allAbove = true;
@@ -927,10 +1085,10 @@ void testRestFrameReproducesSource() {
   shp::RenderParams rp;
 
   std::vector<shp::ShardPose> poses;
-  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, 0.0f, poses);
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, noDepth, 0.0f, poses);
 
   std::vector<shp::ShardDraw> draws;
-  shp::BuildDrawList(*geom, poses, shp::BlurParams{}, draws);
+  shp::BuildDrawList(*geom, poses, shp::BlurParams{}, noDepth, fs, draws);
   shp::TileGrid tiles;
   shp::BuildTileGrid(draws, geom->width, geom->height, tiles);
 
@@ -967,7 +1125,7 @@ void testRestFrameReproducesSource() {
   mb.samples = 8;
 
   std::vector<shp::ShardDraw> bdraws;
-  shp::BuildDrawList(*geom, poses, mb, bdraws);
+  shp::BuildDrawList(*geom, poses, mb, noDepth, fs, bdraws);
   shp::TileGrid btiles;
   shp::BuildTileGrid(bdraws, geom->width, geom->height, btiles);
 
@@ -1003,11 +1161,11 @@ void testMotionBlurSpreads() {
   shp::RenderParams rp;
 
   std::vector<shp::ShardPose> poses;
-  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, 6.0f, poses);
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, noDepth, 6.0f, poses);
 
   auto renderWith = [&](const shp::BlurParams& mb, TestImage& out) {
     std::vector<shp::ShardDraw> draws;
-    shp::BuildDrawList(*geom, poses, mb, draws);
+    shp::BuildDrawList(*geom, poses, mb, noDepth, fs, draws);
     shp::TileGrid tiles;
     shp::BuildTileGrid(draws, geom->width, geom->height, tiles);
     out.w = img.w;
@@ -1115,6 +1273,8 @@ int main() {
   testColliderShapes();
   testRotatedBoxHandles();
   testRotateHandle();
+  testDepth();
+  testEdgeField();
   testFadeDoesNotInvalidateSim();
   testPiecesRestOnFloor();
   testRestFrameReproducesSource();

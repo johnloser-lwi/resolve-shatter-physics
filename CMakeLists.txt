@@ -22,6 +22,7 @@ add_library(shp_core STATIC
   src/core/Segmentation.cpp
   src/core/Cells.cpp
   src/core/Compositor.cpp
+  src/core/EdgeField.cpp
   src/core/Physics2D.cpp
   src/core/SimCache.cpp
 )

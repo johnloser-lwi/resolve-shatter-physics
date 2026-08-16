@@ -426,6 +426,10 @@ std::shared_ptr<const ShatterGeometry> buildGeometry(const ConstImageView& src,
     geom->meanRadius = n > 0.0 ? float(radius / n) : 1.0f;
   }
 
+  // 6c. Distance to each piece's own edge, for the bevel. Built from the final
+  //     label image, so cuts and despeckling are already accounted for.
+  if (params.buildEdgeField) BuildEdgeField(geom->labelImage, w, h, geom->edges);
+
   // 7. Collision proxies, only when someone is going to collide them.
   if (params.buildPolygons) {
     // Reads geom->labelImage rather than lr.labels: the labels were moved into

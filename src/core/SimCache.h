@@ -66,9 +66,13 @@ class SimCache {
    * scrub after a parameter change makes one thread wait for the rebuild rather
    * than starting a second one.
    */
+  /// @param dp depth is applied AFTER the simulation, like the fade, so changing
+  ///        it never throws away a cached run. The solver is flat and has no
+  ///        opinion about z.
   void getPoses(const std::shared_ptr<const ShatterGeometry>& geom, const ForceParams& fp,
                 const PhysicsParams& pp, const RenderParams& rp, const FrameScale& fs,
-                const std::vector<Collider>& colliders, float t, std::vector<ShardPose>& out);
+                const DepthParams& dp, const std::vector<Collider>& colliders, float t,
+                std::vector<ShardPose>& out);
 
  private:
   void rebuild(const std::shared_ptr<const ShatterGeometry>& geom, const ForceParams& fp,

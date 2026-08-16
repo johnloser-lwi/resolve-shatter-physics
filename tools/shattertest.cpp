@@ -1,4 +1,4 @@
-// Offline harness: PNG in, shattered frames out.
+﻿// Offline harness: PNG in, shattered frames out.
 //
 // This links the *same* src/core the plugin does, which is the whole point of
 // the no-OFX-headers rule. Tuning a shatter here costs a second; tuning it
@@ -207,6 +207,7 @@ int main(int argc, char** argv) {
   shp::PhysicsParams pp;
   shp::RenderParams rp;
   shp::CompositeParams cp;
+  shp::DepthParams dp;
   shp::BlurParams mb;
 
   fp.f1.enabled = true;
@@ -255,6 +256,19 @@ int main(int argc, char** argv) {
     else if (a == "--no-collide") pp.collideShards = false;
     else if (a == "--substeps") pp.substeps = int(next(4));
     else if (a == "--bench") bench = int(next(30));
+    else if (a == "--depth") dp.spread = next(0.6f);
+    else if (a == "--depth-bias") dp.bias = next(0.0f);
+    else if (a == "--perspective") dp.perspective = next(0.5f);
+    else if (a == "--aerial") dp.aerial = next(0.4f);
+    else if (a == "--tumble") dp.tumble = next(0.8f);
+    else if (a == "--bevel") { cp.bevel = next(0.8f); sp.buildEdgeField = true; }
+    else if (a == "--bevel-width") cp.bevelWidth = next(8.0f);
+    else if (a == "--light") {
+      const float deg = next(315.0f);
+      const float r = deg * shp::kPi / 180.0f;
+      cp.lightX = sinf(r);
+      cp.lightY = -cosf(r);
+    }
     else if (a == "--blur") mb.enabled = true;
     else if (a == "--shutter") mb.shutterAngle = next(180.0f);
     else if (a == "--blur-samples") mb.samples = int(next(8));
@@ -327,11 +341,11 @@ int main(int argc, char** argv) {
     out.h = src.h;
     out.px.assign(std::size_t(out.w) * std::size_t(out.h) * 4, 0.0f);
     if (rigid) {
-      sim.getPoses(geom, fp, pp, rp, fs, colliders, t, poses);
+      sim.getPoses(geom, fp, pp, rp, fs, dp, colliders, t, poses);
     } else {
-      shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, t, poses);
+      shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, dp, t, poses);
     }
-    shp::BuildDrawList(*geom, poses, mb, draws);
+    shp::BuildDrawList(*geom, poses, mb, dp, fs, draws);
     shp::BuildTileGrid(draws, geom->width, geom->height, tiles);
     shp::Composite(out.mutableView(), src.view(), *geom, draws, tiles, cp);
   };

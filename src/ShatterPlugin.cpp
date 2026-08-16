@@ -187,6 +187,15 @@ class ShatterPhysicsPlugin : public OFX::ImageEffect {
     _colliderTool = fetchBooleanParam(shp::kParamColliderTool);
     _colliderShape = fetchChoiceParam(shp::kParamColliderShape);
 
+    _depthSpread = fetchDoubleParam(shp::kParamDepthSpread);
+    _depthBias = fetchDoubleParam(shp::kParamDepthBias);
+    _perspective = fetchDoubleParam(shp::kParamPerspective);
+    _aerial = fetchDoubleParam(shp::kParamAerial);
+    _tumble = fetchDoubleParam(shp::kParamTumble);
+    _bevel = fetchDoubleParam(shp::kParamBevel);
+    _bevelWidth = fetchDoubleParam(shp::kParamBevelWidth);
+    _lightAngle = fetchDoubleParam(shp::kParamLightAngle);
+
     _startFrame = fetchIntParam(shp::kParamStartFrame);
     _seed = fetchIntParam(shp::kParamSeed);
 
@@ -221,6 +230,7 @@ class ShatterPhysicsPlugin : public OFX::ImageEffect {
   shp::ShapeParams readShape(double t) const;
   shp::ForceParams readForces(double t) const;
   std::vector<shp::Collider> readColliders(double t) const;
+  shp::DepthParams readDepth(double t) const;
   shp::PhysicsParams readPhysics(double t) const;
   shp::RenderParams readRender(double t) const;
   void syncVisibility();
@@ -283,6 +293,15 @@ class ShatterPhysicsPlugin : public OFX::ImageEffect {
   OFX::StringParam* _colliders = nullptr;
   OFX::BooleanParam* _colliderTool = nullptr;
   OFX::ChoiceParam* _colliderShape = nullptr;
+
+  OFX::DoubleParam* _depthSpread = nullptr;
+  OFX::DoubleParam* _depthBias = nullptr;
+  OFX::DoubleParam* _perspective = nullptr;
+  OFX::DoubleParam* _aerial = nullptr;
+  OFX::DoubleParam* _tumble = nullptr;
+  OFX::DoubleParam* _bevel = nullptr;
+  OFX::DoubleParam* _bevelWidth = nullptr;
+  OFX::DoubleParam* _lightAngle = nullptr;
 
   OFX::IntParam* _startFrame = nullptr;
   OFX::IntParam* _seed = nullptr;
@@ -357,6 +376,16 @@ shp::ShapeParams ShatterPhysicsPlugin::readShape(double t) const {
   // Collision hulls cost real time on a thousand-shard frame, and the ballistic
   // mode never looks at them.
   sp.buildPolygons = choiceAt(_simMode, t, 0, 1) == shp::kSimRigidBody;
+
+  // Likewise the edge field: two more bytes per pixel and a pair of sweeps, so
+  // it is built only once the bevel is actually asked for. Part of the shape
+  // params rather than the render params because it changes what the analysis
+  // cache has to produce.
+  {
+    double bevel = 0.0;
+    _bevel->getValueAtTime(t, bevel);
+    sp.buildEdgeField = bevel > 0.0;
+  }
   return sp;
 }
 
@@ -432,6 +461,22 @@ std::vector<shp::Collider> ShatterPhysicsPlugin::readColliders(double t) const {
   std::string s;
   _colliders->getValueAtTime(t, s);
   return shp::ParseColliders(s);
+}
+
+shp::DepthParams ShatterPhysicsPlugin::readDepth(double t) const {
+  shp::DepthParams dp;
+  double d = 0.0;
+  _depthSpread->getValueAtTime(t, d);
+  dp.spread = float(d);
+  _depthBias->getValueAtTime(t, d);
+  dp.bias = float(d);
+  _perspective->getValueAtTime(t, d);
+  dp.perspective = float(d);
+  _aerial->getValueAtTime(t, d);
+  dp.aerial = float(d);
+  _tumble->getValueAtTime(t, d);
+  dp.tumble = float(d);
+  return dp;
 }
 
 shp::RenderParams ShatterPhysicsPlugin::readRender(double t) const {
@@ -656,6 +701,20 @@ bool ShatterPhysicsPlugin::renderCuda(const OFX::RenderArguments& args, OFX::Ima
   shp::CompositeParams cp;
   _edgeAntialias->getValueAtTime(t, cp.edgeAntialias);
   _showPieces->getValueAtTime(t, cp.showPieces);
+  {
+    double d = 0.0;
+    _bevel->getValueAtTime(t, d);
+    cp.bevel = float(d);
+    _bevelWidth->getValueAtTime(t, d);
+    // A percentage of frame height, so the pieces look equally thick whatever
+    // the timeline resolution.
+    cp.bevelWidth = float(d * 0.01) * float(dst->getBounds().y2 - dst->getBounds().y1);
+    _lightAngle->getValueAtTime(t, d);
+    const float a = float(d) * shp::kPi / 180.0f;
+    // Top-down space, matching gravity's convention: 0 is from above.
+    cp.lightX = sinf(a);
+    cp.lightY = -cosf(a);
+  }
 
   shp::BlurParams blur;
   _motionBlur->getValueAtTime(t, blur.enabled);
@@ -674,15 +733,16 @@ bool ShatterPhysicsPlugin::renderCuda(const OFX::RenderArguments& args, OFX::Ima
   fs.meanArea = geom->meanArea;
   fs.meanRadius = geom->meanRadius;
 
+  const shp::DepthParams dp = readDepth(t);
   const bool rigid = choiceAt(_simMode, t, 0, 1) == shp::kSimRigidBody;
 
   std::lock_guard<std::mutex> lock(_scratchMutex);
   if (rigid) {
-    _sim.getPoses(geom, fp, pp, rp, fs, readColliders(t), float(clipT), _poses);
+    _sim.getPoses(geom, fp, pp, rp, fs, dp, readColliders(t), float(clipT), _poses);
   } else {
-    shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, float(clipT), _poses);
+    shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, dp, float(clipT), _poses);
   }
-  shp::BuildDrawList(*geom, _poses, blur, _draws);
+  shp::BuildDrawList(*geom, _poses, blur, dp, fs, _draws);
   shp::BuildTileGrid(_draws, geom->width, geom->height, _tiles);
 
   // The label image is 33 MB at 4K, so it is uploaded when the geometry object
@@ -690,8 +750,12 @@ bool ShatterPhysicsPlugin::renderCuda(const OFX::RenderArguments& args, OFX::Ima
   // reason the other caches use it: the analysis cache guarantees one object per
   // content, and the shared_ptr above keeps the address from being recycled.
   if (_devLabelsFor != geom.get()) {
-    if (!shp::CudaUploadLabels(_cuda, geom->labelImage.data(), geom->width, geom->height,
-                               stream))
+    const bool haveEdges = geom->edges.valid() && geom->edges.width == geom->width &&
+                           geom->edges.height == geom->height;
+    if (!shp::CudaUploadLabels(_cuda, geom->labelImage.data(),
+                               haveEdges ? geom->edges.dist.data() : nullptr,
+                               haveEdges ? geom->edges.angle.data() : nullptr, geom->width,
+                               geom->height, stream))
       return false;
     _devLabelsFor = geom.get();
   }
@@ -766,6 +830,20 @@ void ShatterPhysicsPlugin::render(const OFX::RenderArguments& args) {
   shp::CompositeParams cp;
   _edgeAntialias->getValueAtTime(t, cp.edgeAntialias);
   _showPieces->getValueAtTime(t, cp.showPieces);
+  {
+    double d = 0.0;
+    _bevel->getValueAtTime(t, d);
+    cp.bevel = float(d);
+    _bevelWidth->getValueAtTime(t, d);
+    // A percentage of frame height, so the pieces look equally thick whatever
+    // the timeline resolution.
+    cp.bevelWidth = float(d * 0.01) * float(dst->getBounds().y2 - dst->getBounds().y1);
+    _lightAngle->getValueAtTime(t, d);
+    const float a = float(d) * shp::kPi / 180.0f;
+    // Top-down space, matching gravity's convention: 0 is from above.
+    cp.lightX = sinf(a);
+    cp.lightY = -cosf(a);
+  }
 
   shp::BlurParams blur;
   _motionBlur->getValueAtTime(t, blur.enabled);
@@ -799,6 +877,7 @@ void ShatterPhysicsPlugin::render(const OFX::RenderArguments& args) {
   fs.meanArea = geom->meanArea;
   fs.meanRadius = geom->meanRadius;
 
+  const shp::DepthParams dp = readDepth(t);
   const bool rigid = choiceAt(_simMode, t, 0, 1) == shp::kSimRigidBody;
 
   std::lock_guard<std::mutex> lock(_scratchMutex);
@@ -806,11 +885,11 @@ void ShatterPhysicsPlugin::render(const OFX::RenderArguments& args) {
     // Steps forward from the start frame on a cache miss, then serves stored
     // poses. Scrubbing backward is a lookup; the first render deep into a clip
     // pays for the whole prefix once.
-    _sim.getPoses(geom, fp, pp, rp, fs, readColliders(t), float(clipT), _poses);
+    _sim.getPoses(geom, fp, pp, rp, fs, dp, readColliders(t), float(clipT), _poses);
   } else {
-    shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, float(clipT), _poses);
+    shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, dp, float(clipT), _poses);
   }
-  shp::BuildDrawList(*geom, _poses, blur, _draws);
+  shp::BuildDrawList(*geom, _poses, blur, dp, fs, _draws);
   shp::BuildTileGrid(_draws, geom->width, geom->height, _tiles);
   shp::Composite(dstView, srcView, *geom, _draws, _tiles, cp);
 }
@@ -1376,6 +1455,113 @@ void ShatterPhysicsFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
     p->setDisplayRange(1, 8);
     p->setDefault(4);
     addParam(page, p, gPhys);
+  }
+
+  // ------------------------------------------------------------------- Depth
+  //
+  // Everything here defaults to off. The effect had no depth before this group
+  // existed, and quietly changing how every saved project looks is not a thing
+  // a new feature gets to do.
+  OFX::GroupParamDescriptor* gDepth = defineGroup("grpDepth", "Depth (3D Look)", false);
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam(shp::kParamDepthSpread);
+    p->setLabels("Depth Spread", "Depth", "Depth Spread");
+    p->setHint(
+        "Throws pieces toward and away from the camera as well as across the "
+        "frame. Near ones grow and pass in front, far ones shrink and fall "
+        "behind. This is the master switch for the whole 3D look -- at 0 "
+        "everything stays flat.\n\n"
+        "Scaled by how hard each piece was actually thrown, so a gentle shatter "
+        "stays shallow.");
+    p->setRange(0.0, 5.0);
+    p->setDisplayRange(0.0, 1.5);
+    p->setDefault(0.0);
+    addParam(page, p, gDepth);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam(shp::kParamDepthBias);
+    p->setLabels("  Toward / Away", "Bias", "Depth Bias");
+    p->setHint(
+        "Pushes every piece the same way in depth regardless of the forces. "
+        "Negative brings the shatter at the camera; positive lets it recede.");
+    p->setRange(-20.0, 20.0);
+    p->setDisplayRange(-2.0, 2.0);
+    p->setDefault(0.0);
+    addParam(page, p, gDepth);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam(shp::kParamPerspective);
+    p->setLabels("  Perspective", "Perspective", "Perspective");
+    p->setHint(
+        "How strongly depth changes a piece's size. 0 is a flat, orthographic "
+        "look where depth still decides what covers what; higher exaggerates it "
+        "like a wide lens.");
+    p->setRange(0.0, 4.0);
+    p->setDisplayRange(0.0, 1.5);
+    p->setDefault(0.5);
+    addParam(page, p, gDepth);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam(shp::kParamAerial);
+    p->setLabels("  Distance Fade", "Dist Fade", "Distance Fade");
+    p->setHint(
+        "Darkens pieces as they recede, the way distance washes out anything "
+        "far away. A little goes a long way.");
+    p->setRange(0.0, 1.0);
+    p->setDisplayRange(0.0, 1.0);
+    p->setDefault(0.0);
+    addParam(page, p, gDepth);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam(shp::kParamTumble);
+    p->setLabels("Tumble", "Tumble", "Tumble");
+    p->setHint(
+        "Flips pieces end over end as well as spinning them flat, so they "
+        "narrow to an edge and open out again. This is what stops them reading "
+        "as paper cutouts turning on a table.\n\n"
+        "Follows Rotation Speed, so a fast-spinning shatter also flips fast.");
+    p->setRange(0.0, 5.0);
+    p->setDisplayRange(0.0, 2.0);
+    p->setDefault(0.0);
+    addParam(page, p, gDepth);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam(shp::kParamBevel);
+    p->setLabels("Edge Shading", "Edge Shading", "Edge Shading");
+    p->setHint(
+        "Shades a band along every cut edge -- bright where it faces the light, "
+        "dark where it faces away -- so each piece reads as having thickness "
+        "rather than being a flat cutout. The single most convincing part of "
+        "the 3D illusion, and it works even with everything else here at 0.");
+    p->setRange(0.0, 3.0);
+    p->setDisplayRange(0.0, 1.5);
+    p->setDefault(0.0);
+    addParam(page, p, gDepth);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam(shp::kParamBevelWidth);
+    p->setLabels("  Edge Width", "Edge Width", "Edge Width");
+    p->setHint(
+        "How thick the pieces look, as a percentage of frame height. Wide reads "
+        "as chunky masonry; narrow reads as glass.");
+    p->setRange(0.0, 20.0);
+    p->setDisplayRange(0.1, 4.0);
+    p->setDefault(0.8);
+    addParam(page, p, gDepth);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam(shp::kParamLightAngle);
+    p->setLabels("  Light Angle", "Light", "Light Angle");
+    p->setHint(
+        "Where the light comes from, in degrees, using the same convention as "
+        "Gravity Direction -- 180 is from directly above. The default is the "
+        "usual key light over your left shoulder.\n\n"
+        "The lighting stays fixed while the pieces turn under it, which is most "
+        "of why the edges read as solid rather than painted on.");
+    p->setRange(-3600.0, 3600.0);
+    p->setDisplayRange(0.0, 360.0);
+    p->setDefault(135.0);   // from the top-left
+    addParam(page, p, gDepth);
   }
 
   // ------------------------------------------------------------------ Timing

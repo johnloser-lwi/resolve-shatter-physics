@@ -73,12 +73,18 @@ struct ShapeParams {
   /// on a thousand-shard frame and the ballistic mode never looks at them.
   bool buildPolygons = false;
 
+  /// Whether the bevel needs its distance-to-edge field. Two more bytes per
+  /// pixel and a pair of sweeps over the frame, so it is not built for a flat
+  /// shatter that will never read it.
+  bool buildEdgeField = false;
+
   bool operator==(const ShapeParams& o) const {
     return pattern == o.pattern && cellCount == o.cellCount && cellJitter == o.cellJitter &&
            brickRows == o.brickRows && brickOffset == o.brickOffset && mapLevels == o.mapLevels &&
            alphaThreshold == o.alphaThreshold && minPieceArea == o.minPieceArea &&
            bridgeRadius == o.bridgeRadius && shapeSeed == o.shapeSeed &&
-           buildPolygons == o.buildPolygons && slices == o.slices;
+           buildPolygons == o.buildPolygons && buildEdgeField == o.buildEdgeField &&
+           slices == o.slices;
   }
   bool operator!=(const ShapeParams& o) const { return !(*this == o); }
 };

@@ -18,6 +18,7 @@
 // just because its hull is solid.
 #pragma once
 
+#include "EdgeField.h"
 #include "ImageView.h"
 #include "TransformMath.h"
 
@@ -75,6 +76,11 @@ struct ShatterGeometry {
   float meanArea = 1.0f;
   float meanRadius = 1.0f;
 
+  /// Distance-to-edge and edge direction, for the bevel. Built only when the
+  /// bevel is actually switched on: it is two more bytes per pixel and a pair of
+  /// sweeps over the frame, which is not worth paying for a flat shatter.
+  EdgeField edges;
+
   int32_t labelAt(int x, int y) const {
     return labelImage[std::size_t(y) * std::size_t(width) + std::size_t(x)];
   }
@@ -97,6 +103,22 @@ struct ShardPose {
   float scale = 1;         ///< uniform, about the centroid
   float alpha = 1;         ///< multiplied into the sampled pixel
   bool active = false;     ///< false before this shard's detach frame
+
+  // ------------------------------------------------------------------ depth
+  //
+  // There is no third axis in the simulation. These carry just enough of one to
+  // sell the illusion: a piece that moves toward the camera gets bigger and
+  // draws in front, one that moves away gets smaller, dimmer and draws behind.
+  // Nothing else in the solver knows z exists.
+  float z = 0;             ///< positive is AWAY from the camera
+  float vz = 0;            ///< px/frame along z
+
+  /// Rotation about an axis lying in the screen plane, which is what makes a
+  /// piece look like it is flipping rather than spinning. Foreshortening across
+  /// that axis is cos(tumble), so the piece thins to nothing edge-on and opens
+  /// out again -- the standard 2.5D card flip.
+  float tumble = 0;        ///< radians
+  float tumbleAxis = 0;    ///< radians, orientation of the axis in the plane
 
   bool isRest() const {
     return !active && x == 0 && y == 0 && angle == 0 && scale == 1 && alpha == 1;

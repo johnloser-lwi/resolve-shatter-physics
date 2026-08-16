@@ -133,7 +133,7 @@ void SimCache::extendTo(int frame) {
 
 void SimCache::getPoses(const std::shared_ptr<const ShatterGeometry>& geom, const ForceParams& fp,
                         const PhysicsParams& pp, const RenderParams& rp, const FrameScale& fs,
-                        const std::vector<Collider>& colliders, float t,
+                        const DepthParams& dp, const std::vector<Collider>& colliders, float t,
                         std::vector<ShardPose>& out) {
   if (!geom || geom->shards.empty()) {
     out.clear();
@@ -180,23 +180,58 @@ void SimCache::getPoses(const std::shared_ptr<const ShatterGeometry>& geom, cons
     }
   }
 
-  // Fade and shrink are applied here, after the simulation, so that changing
-  // them never invalidates a run. Age is measured from the shard's own detach
-  // frame, which the ballistic path computes the same way.
-  if (rp.fadeDuration > 0.0f) {
-    for (std::size_t i = 0; i < out.size(); ++i) {
-      const Shard& sh = geom->shards[i];
-      ShardSim ss;
-      ss.cx = sh.cx;
-      ss.cy = sh.cy;
-      ss.area = sh.area;
-      ss.radius = sh.radius;
-      ss.inertiaPerMass = sh.inertiaPerMass;
+  // Fade, shrink and depth are all applied here, after the simulation, so that
+  // changing any of them never invalidates a run. Age is measured from the
+  // shard's own detach frame, which the ballistic path computes the same way.
+  const bool wantDepth = dp.spread > 0.0f || dp.bias != 0.0f || dp.tumble > 0.0f;
+  if (rp.fadeDuration <= 0.0f && !wantDepth) return;
 
-      const float age = t - DetachFrame(ss, fp, fs);
-      if (age < 0.0f) continue;
+  const float drag = pp.viscosity * kDragScale;
+
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    const Shard& sh = geom->shards[i];
+    ShardSim ss;
+    ss.cx = sh.cx;
+    ss.cy = sh.cy;
+    ss.area = sh.area;
+    ss.radius = sh.radius;
+    ss.inertiaPerMass = sh.inertiaPerMass;
+
+    const float age = t - DetachFrame(ss, fp, fs);
+    if (age < 0.0f) continue;
+
+    if (rp.fadeDuration > 0.0f)
       ApplyFade(age, rp.fadeStart, rp.fadeDuration, rp.shrinkOnFade, out[i].alpha,
                 out[i].scale);
+
+    if (!wantDepth) continue;
+
+    const uint32_t id = uint32_t(sh.id);
+    const float mass = MassOf(ss, fs, pp, id, uint32_t(fp.seed));
+
+    if (dp.spread > 0.0f || dp.bias != 0.0f) {
+      // Launch speed taken from the impulses, matching the ballistic path
+      // exactly -- the two modes must scatter through depth identically or
+      // switching between them would look like a different effect.
+      ForceImpulse imp[2];
+      const int n = GatherImpulses(ss, fp, pp, fs, id, mass, imp);
+      float launch = 0.0f;
+      for (int e = 0; e < n; ++e) launch += Length(imp[e].linear);
+
+      const float vz0 = InitialDepthVelocity(dp, launch, fs, id, uint32_t(fp.seed));
+      Vec2 zp, zv;
+      IntegrateDrag(Vec2(vz0, 0.0f), Vec2(0.0f, 0.0f), drag, age, zp, zv);
+      out[i].z = zp.x;
+      out[i].vz = zv.x;
+    }
+
+    if (dp.tumble > 0.0f) {
+      float rate = 0.0f, axis = 0.0f;
+      InitialTumble(dp, pp, id, uint32_t(fp.seed), rate, axis);
+      float tAngle = 0.0f, tRate = 0.0f;
+      IntegrateSpin(rate, drag, age, tAngle, tRate);
+      out[i].tumble = tAngle;
+      out[i].tumbleAxis = axis;
     }
   }
 }

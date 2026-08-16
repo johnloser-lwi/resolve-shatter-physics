@@ -1,4 +1,4 @@
-// CPU vs GPU: the same frame, both ways, compared pixel by pixel.
+﻿// CPU vs GPU: the same frame, both ways, compared pixel by pixel.
 //
 // The two paths call the identical ShadePixel through the SHP_HD macro, so in
 // principle they cannot disagree. This exists because "in principle" is exactly
@@ -106,12 +106,13 @@ bool runCase(const char* name, bool edgeAA, bool showPieces, bool blur, float t)
   shp::RenderParams rp;
 
   std::vector<shp::ShardPose> poses;
-  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, t, poses);
+  shp::DepthParams dp;
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, dp, t, poses);
 
   shp::BlurParams mb;
   mb.enabled = blur;
   std::vector<shp::ShardDraw> draws;
-  shp::BuildDrawList(*geom, poses, mb, draws);
+  shp::BuildDrawList(*geom, poses, mb, dp, fs, draws);
 
   shp::TileGrid tiles;
   shp::BuildTileGrid(draws, geom->width, geom->height, tiles);
@@ -132,7 +133,7 @@ bool runCase(const char* name, bool edgeAA, bool showPieces, bool blur, float t)
   gpu.px.assign(src.px.size(), -1.0f);  // poison, so an untouched buffer fails loudly
 
   const bool ran = shp::CudaCompositeHostSync(
-      src.px.data(), gpu.px.data(), geom->labelImage.data(), src.w, src.h, draws.data(),
+      src.px.data(), gpu.px.data(), geom->labelImage.data(), nullptr, nullptr, src.w, src.h, draws.data(),
       int(draws.size()), tiles.start.data(), tiles.tileCount(), tiles.shardIdx.data(),
       int(tiles.shardIdx.size()), tiles.tilesX, tiles.tilesY, cp);
   if (!ran) {

@@ -47,6 +47,9 @@ struct DeviceBuffer {
 
 struct CudaContext {
   DeviceBuffer labels;   ///< int32 per pixel, resident across frames
+  DeviceBuffer edgeDist; ///< uint8 per pixel, uploaded with the labels
+  DeviceBuffer edgeAngle;
+  bool hasEdges = false;
   int labelW = 0, labelH = 0;
 
   DeviceBuffer draws;        ///< ShardDraw array, uploaded per frame
@@ -57,6 +60,8 @@ struct CudaContext {
 
   ~CudaContext() {
     labels.release();
+    edgeDist.release();
+    edgeAngle.release();
     draws.release();
     tileStart.release();
     tileShardIdx.release();
@@ -69,10 +74,12 @@ namespace {
 
 // ------------------------------------------------------------------ kernels
 
-__global__ void kShade(const int32_t* labels, int lw, int lh, SampleView src, float* dst,
-                       long long dstStride, int w, int h, const ShardDraw* draws,
-                       const int32_t* tileStart, const int32_t* tileShardIdx, int tilesX,
-                       int tilesY, int edgeAA, int showPieces) {
+__global__ void kShade(const int32_t* labels, const uint8_t* eDist, const uint8_t* eAngle,
+                       int lw, int lh, SampleView src, float* dst, long long dstStride, int w,
+                       int h, const ShardDraw* draws, const int32_t* tileStart,
+                       const int32_t* tileShardIdx, int tilesX, int tilesY, int edgeAA,
+                       int showPieces, float bevel, float bevelWidth, float lightX,
+                       float lightY) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int y = blockIdx.y * blockDim.y + threadIdx.y;
   if (x >= w || y >= h) return;
@@ -95,8 +102,8 @@ __global__ void kShade(const int32_t* labels, int lw, int lh, SampleView src, fl
   }
 
   // The identical function the CPU path calls.
-  ShadePixel(labels, lw, lh, src, draws, tileShardIdx, lo, hi, x, y, edgeAA != 0,
-             showPieces != 0, out);
+  ShadePixel(labels, eDist, eAngle, lw, lh, src, draws, tileShardIdx, lo, hi, x, y,
+             edgeAA != 0, showPieces != 0, bevel, bevelWidth, lightX, lightY, out);
 }
 
 /// Order-independent content fingerprint.
@@ -179,14 +186,29 @@ bool CudaDownload(CudaContext* ctx, const float* devSrc, int width, int height,
   return ok(cudaStreamSynchronize(s));
 }
 
-bool CudaUploadLabels(CudaContext* ctx, const std::int32_t* labels, int width, int height,
-                      void* stream) {
+bool CudaUploadLabels(CudaContext* ctx, const std::int32_t* labels, const std::uint8_t* eDist,
+                      const std::uint8_t* eAngle, int width, int height, void* stream) {
   if (!ctx || !labels) return false;
-  const std::size_t n = std::size_t(width) * std::size_t(height) * sizeof(std::int32_t);
+  const std::size_t px = std::size_t(width) * std::size_t(height);
+  const std::size_t n = px * sizeof(std::int32_t);
   if (!ctx->labels.ensure(n)) return false;
 
   cudaStream_t s = static_cast<cudaStream_t>(stream);
   if (!ok(cudaMemcpyAsync(ctx->labels.p, labels, n, cudaMemcpyHostToDevice, s))) return false;
+
+  // The edge field rides along with the labels because it is derived from them:
+  // whenever one is stale so is the other, so keying them separately would be
+  // two ways to describe one fact.
+  ctx->hasEdges = false;
+  if (eDist && eAngle) {
+    if (!ctx->edgeDist.ensure(px) || !ctx->edgeAngle.ensure(px)) return false;
+    if (!ok(cudaMemcpyAsync(ctx->edgeDist.p, eDist, px, cudaMemcpyHostToDevice, s)))
+      return false;
+    if (!ok(cudaMemcpyAsync(ctx->edgeAngle.p, eAngle, px, cudaMemcpyHostToDevice, s)))
+      return false;
+    ctx->hasEdges = true;
+  }
+
   ctx->labelW = width;
   ctx->labelH = height;
   return true;
@@ -234,18 +256,24 @@ bool CudaComposite(CudaContext* ctx, const float* devSrc, float* devDst, int wid
 
   const dim3 block(16, 16);
   const dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+  const bool bevelOn = params.bevel > 0.0f && ctx->hasEdges;
   kShade<<<grid, block, 0, s>>>(
-      static_cast<const int32_t*>(ctx->labels.p), ctx->labelW, ctx->labelH, sv, devDst,
-      (long long)dstStrideFloats, width, height, static_cast<const ShardDraw*>(ctx->draws.p),
+      static_cast<const int32_t*>(ctx->labels.p),
+      bevelOn ? static_cast<const uint8_t*>(ctx->edgeDist.p) : nullptr,
+      bevelOn ? static_cast<const uint8_t*>(ctx->edgeAngle.p) : nullptr, ctx->labelW,
+      ctx->labelH, sv, devDst, (long long)dstStrideFloats, width, height,
+      static_cast<const ShardDraw*>(ctx->draws.p),
       static_cast<const int32_t*>(ctx->tileStart.p),
       static_cast<const int32_t*>(ctx->tileShardIdx.p), tilesX, tilesY,
-      params.edgeAntialias ? 1 : 0, params.showPieces ? 1 : 0);
+      params.edgeAntialias ? 1 : 0, params.showPieces ? 1 : 0, bevelOn ? params.bevel : 0.0f,
+      params.bevelWidth, params.lightX, params.lightY);
 
   return ok(cudaGetLastError());
 }
 
 bool CudaCompositeHostSync(const float* hostSrc, float* hostDst, const std::int32_t* labels,
-                           int width, int height, const ShardDraw* draws, int drawCount,
+                           const std::uint8_t* eDist, const std::uint8_t* eAngle, int width,
+                           int height, const ShardDraw* draws, int drawCount,
                            const std::int32_t* tileStart, int tileCount,
                            const std::int32_t* tileShardIdx, int tileShardCount, int tilesX,
                            int tilesY, const CompositeParams& params) {
@@ -260,7 +288,7 @@ bool CudaCompositeHostSync(const float* hostSrc, float* hostDst, const std::int3
   if (!ok(cudaMemcpy(devSrc.p, hostSrc, frameBytes, cudaMemcpyHostToDevice))) return false;
   if (!ok(cudaMemset(devDst.p, 0, frameBytes))) return false;
 
-  if (!CudaUploadLabels(&ctx, labels, width, height, nullptr)) return false;
+  if (!CudaUploadLabels(&ctx, labels, eDist, eAngle, width, height, nullptr)) return false;
   cudaStreamSynchronize(nullptr);
 
   // Host buffers here are packed top-down, so the strides are positive. In the

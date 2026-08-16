@@ -121,6 +121,18 @@ enum SimModeIndex {
   kSimRigidBody = 1,   // stepped simulation with contacts, cached
 };
 
+// ------------------------------------------------------------------- Depth
+// A fake third axis. Nothing in the simulation sees it; only the compositor
+// does, through scale, draw order and shading.
+constexpr const char* kParamDepthSpread = "depthSpread";
+constexpr const char* kParamDepthBias   = "depthBias";
+constexpr const char* kParamPerspective = "perspective";
+constexpr const char* kParamAerial      = "aerial";
+constexpr const char* kParamTumble      = "tumble";
+constexpr const char* kParamBevel       = "bevel";
+constexpr const char* kParamBevelWidth  = "bevelWidth";
+constexpr const char* kParamLightAngle  = "lightAngle";
+
 // ------------------------------------------------------------------ Timing
 constexpr const char* kParamStartFrame = "startFrame";
 constexpr const char* kParamSeed       = "seed";

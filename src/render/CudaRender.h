@@ -71,8 +71,11 @@ bool CudaDownload(CudaContext* ctx, const float* devSrc, int width, int height,
 /// Upload a freshly built label image. Kept resident afterwards, and re-uploaded
 /// only when the geometry object changes -- 33 MB at 4K, so once per edit rather
 /// than once per frame.
-bool CudaUploadLabels(CudaContext* ctx, const std::int32_t* labels, int width, int height,
-                      void* stream);
+/// @param eDist,eAngle the bevel's edge field, or null when there is no bevel.
+///        It rides along with the labels because it is derived from them --
+///        whenever one is stale so is the other.
+bool CudaUploadLabels(CudaContext* ctx, const std::int32_t* labels, const std::uint8_t* eDist,
+                      const std::uint8_t* eAngle, int width, int height, void* stream);
 
 /// Composite into @p devDst using the resident labels.
 ///
@@ -90,7 +93,8 @@ bool CudaComposite(CudaContext* ctx, const float* devSrc, float* devDst, int wid
 /// rather than a second build of "the same" code -- which is precisely the
 /// situation a parity test is there to rule out.
 bool CudaCompositeHostSync(const float* hostSrc, float* hostDst, const std::int32_t* labels,
-                           int width, int height, const ShardDraw* draws, int drawCount,
+                           const std::uint8_t* eDist, const std::uint8_t* eAngle, int width,
+                           int height, const ShardDraw* draws, int drawCount,
                            const std::int32_t* tileStart, int tileCount,
                            const std::int32_t* tileShardIdx, int tileShardCount, int tilesX,
                            int tilesY, const CompositeParams& params);

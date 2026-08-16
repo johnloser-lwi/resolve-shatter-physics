@@ -55,6 +55,10 @@ struct ShardDraw {
   int32_t label = 0;            ///< what to expect in the label image
   float alpha = 1.0f;
   int x1 = 0, y1 = 0, x2 = 0, y2 = 0;  ///< destination bounds, clipped to the frame
+
+  float z = 0.0f;      ///< only used to sort; the kernel never reads it
+  float shade = 1.0f;  ///< aerial perspective, multiplied into the sampled pixel
+  float angle = 0.0f;  ///< the piece's rotation, for turning the bevel normals
 };
 
 struct BlurParams {
@@ -66,6 +70,12 @@ struct BlurParams {
 struct CompositeParams {
   bool edgeAntialias = true;
   bool showPieces = false;  ///< diagnostic tint instead of the source pixels
+
+  /// Inner bevel. 0 switches it off, and the edge field is then not even built.
+  float bevel = 0.0f;
+  float bevelWidth = 8.0f;   ///< pixels
+  float lightX = -0.707f;    ///< unit vector, the direction light travels
+  float lightY = -0.707f;
 };
 
 /** @brief Build the draw list for one frame.
@@ -80,7 +90,8 @@ struct CompositeParams {
  * source frames are fetched -- which is why this plugin can leave temporal clip
  * access switched off. */
 void BuildDrawList(const ShatterGeometry& geom, const std::vector<ShardPose>& poses,
-                   const BlurParams& blur, std::vector<ShardDraw>& out);
+                   const BlurParams& blur, const DepthParams& depth, const FrameScale& fs,
+                   std::vector<ShardDraw>& out);
 
 /** @brief Bin the draw list into tiles. */
 void BuildTileGrid(const std::vector<ShardDraw>& draws, int width, int height, TileGrid& out);
@@ -116,14 +127,58 @@ SHP_HD inline bool StencilHit(const int32_t* labels, int lw, int lh, float sx, f
   return labels[(long long)(iy) * lw + ix] == label;
 }
 
+/** @brief Brightness at one point inside a piece, from its bevel.
+ *
+ * Returns a multiplier: above 1 on the edge facing the light, below 1 on the
+ * edge facing away, and exactly 1 everywhere further in than the bevel's width.
+ *
+ * @param edgeDist,edgeAngle the packed field, or null when there is no bevel
+ * @param shardAngle         the piece's current rotation, added to the stored
+ *                           normal so the lighting stays fixed in the world
+ *                           while the piece turns under it
+ */
+SHP_HD inline float BevelShade(const uint8_t* edgeDist, const uint8_t* edgeAngle, int lw,
+                               int lh, int ix, int iy, float shardAngle, float strength,
+                               float widthPx, float lightX, float lightY) {
+  if (!edgeDist || strength <= 0.0f || widthPx <= 0.01f) return 1.0f;
+
+  const long long p = (long long)(iy) * lw + ix;
+  const float d = float(edgeDist[p]);
+  if (d >= widthPx) return 1.0f;   // deep inside: flat
+
+  // Falloff across the bevel. Squared so the band hugs the edge rather than
+  // washing across the whole piece, which is what a chamfer actually looks like.
+  const float t = 1.0f - d / widthPx;
+  const float falloff = t * t;
+
+  // The stored normal points into the piece, in the piece's own frame. Adding
+  // the piece's rotation puts it back into the world, which is the difference
+  // between a light that stays put and one that spins with the debris.
+  const float a = float(edgeAngle[p]) * (2.0f * kPi / 255.0f) + shardAngle;
+  const float nx = cosf(a);
+  const float ny = sinf(a);
+
+  // Lambert against the surface of the chamfer. The outward face is the
+  // negation of the inward normal, so this dot comes out positive exactly where
+  // the edge is turned toward the light.
+  const float lambert = nx * lightX + ny * lightY;
+
+  // Highlights are weaker than shadows on purpose: a bevel catching light reads
+  // as a thin bright line, while the shadow side is a broader, softer mass.
+  const float amount = lambert > 0.0f ? lambert * 0.6f : lambert;
+  return Clampf(1.0f + strength * falloff * amount, 0.0f, 4.0f);
+}
+
 /** @brief Shade one destination pixel from the shards binned to its tile.
  *
  * @param lo,hi the CSR range for this pixel's tile.
  * @param out   four premultiplied floats; written unconditionally.
  */
-SHP_HD inline void ShadePixel(const int32_t* labels, int lw, int lh, const SampleView& src,
+SHP_HD inline void ShadePixel(const int32_t* labels, const uint8_t* edgeDist,
+                              const uint8_t* edgeAngle, int lw, int lh, const SampleView& src,
                               const ShardDraw* draws, const int32_t* tileShardIdx, int32_t lo,
                               int32_t hi, int x, int y, bool edgeAntialias, bool showPieces,
+                              float bevel, float bevelWidth, float lightX, float lightY,
                               float* out) {
   out[0] = out[1] = out[2] = out[3] = 0.0f;
 
@@ -174,14 +229,25 @@ SHP_HD inline void ShadePixel(const int32_t* labels, int lw, int lh, const Sampl
         SampleBilinear(src, sx, sy, kEdgeBlack, px);
       }
 
-      // Coverage and the shard's own fade both scale all four channels: the
-      // source is premultiplied, so fading means scaling the premultiplied
-      // colour too. Touching alpha alone leaves the colour too bright and the
-      // fade looks wrong over anything but black.
+      // Bevel and aerial perspective touch COLOUR only, never alpha. Dimming a
+      // piece's alpha would make it translucent rather than dark, and the edge
+      // it is supposed to be shading would show whatever is behind it.
+      float lum = d.shade;
+      if (bevel > 0.0f) {
+        const int bx = int(sx), by = int(sy);
+        if (sx >= 0.0f && sy >= 0.0f && bx < lw && by < lh)
+          lum *= BevelShade(edgeDist, edgeAngle, lw, lh, bx, by, d.angle, bevel, bevelWidth,
+                            lightX, lightY);
+      }
+
+      // Coverage and the shard's own fade scale all four channels: the source is
+      // premultiplied, so fading means scaling the premultiplied colour too.
+      // Touching alpha alone leaves the colour too bright and the fade looks
+      // wrong over anything but black.
       const float a = cov * d.alpha;
-      acc[0] += px[0] * a;
-      acc[1] += px[1] * a;
-      acc[2] += px[2] * a;
+      acc[0] += px[0] * a * lum;
+      acc[1] += px[1] * a * lum;
+      acc[2] += px[2] * a * lum;
       acc[3] += px[3] * a;
       any = true;
     }

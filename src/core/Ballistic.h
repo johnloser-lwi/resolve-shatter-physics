@@ -10,6 +10,7 @@
 // forward from the start.
 #pragma once
 
+#include "Depth.h"
 #include "Forces.h"
 #include "ShardGeom.h"
 
@@ -98,7 +99,8 @@ struct RenderParams {
  */
 inline void EvaluateBallistic(const std::vector<Shard>& shards, const ForceParams& fp,
                               const PhysicsParams& pp, const RenderParams& rp,
-                              const FrameScale& fs, float t, std::vector<ShardPose>& out) {
+                              const FrameScale& fs, const DepthParams& dp, float t,
+                              std::vector<ShardPose>& out) {
   out.assign(shards.size(), ShardPose{});
 
   const Vec2 g = GravityVector(pp, fs);
@@ -176,6 +178,33 @@ inline void EvaluateBallistic(const std::vector<Shard>& shards, const ForceParam
       w = nw;
     }
 
+    // Depth rides along on the same timeline. It has no gravity of its own --
+    // "down" is a direction in the picture plane, and a piece drifting toward
+    // the camera under gravity would look like a mistake -- so it is drag alone.
+    const float age = t - detach;
+    float zPos = 0.0f, zVel = 0.0f;
+    if (dp.spread > 0.0f || dp.bias != 0.0f) {
+      // The speed it was actually thrown at, taken from the impulses rather
+      // than from the pose, so a piece that has since been slowed by drag still
+      // scatters in depth by as much as its launch deserved.
+      float launch = 0.0f;
+      for (int e = 0; e < nImp; ++e) launch += Length(imp[e].linear);
+
+      const float vz0 = InitialDepthVelocity(dp, launch, fs, id, uint32_t(fp.seed));
+      Vec2 zp, zv;
+      IntegrateDrag(Vec2(vz0, 0.0f), Vec2(0.0f, 0.0f), drag, age, zp, zv);
+      zPos = zp.x;
+      zVel = zv.x;
+    }
+
+    float tumbleRate = 0.0f, tumbleAxis = 0.0f;
+    if (dp.tumble > 0.0f) {
+      InitialTumble(dp, pp, id, uint32_t(fp.seed), tumbleRate, tumbleAxis);
+      float tAngle = 0.0f, tRate = 0.0f;
+      IntegrateSpin(tumbleRate, drag, age, tAngle, tRate);
+      tumbleRate = tAngle;
+    }
+
     p.active = true;
     p.x = pos.x;
     p.y = pos.y;
@@ -183,7 +212,11 @@ inline void EvaluateBallistic(const std::vector<Shard>& shards, const ForceParam
     p.vy = vel.y;
     p.angle = angle;
     p.w = w;
-    ApplyFade(t - detach, rp.fadeStart, rp.fadeDuration, rp.shrinkOnFade, p.alpha, p.scale);
+    p.z = zPos;
+    p.vz = zVel;
+    p.tumble = tumbleRate;
+    p.tumbleAxis = tumbleAxis;
+    ApplyFade(age, rp.fadeStart, rp.fadeDuration, rp.shrinkOnFade, p.alpha, p.scale);
   }
 }
 

@@ -9,7 +9,8 @@
 namespace shp {
 
 void BuildDrawList(const ShatterGeometry& geom, const std::vector<ShardPose>& poses,
-                   const BlurParams& blur, std::vector<ShardDraw>& out) {
+                   const BlurParams& blur, const DepthParams& depth, const FrameScale& fs,
+                   std::vector<ShardDraw>& out) {
   out.clear();
   out.reserve(geom.shards.size());
 
@@ -26,6 +27,9 @@ void BuildDrawList(const ShatterGeometry& geom, const std::vector<ShardPose>& po
     ShardDraw d;
     d.label = sh.id;
     d.alpha = p.alpha;
+    d.z = p.z;
+    d.angle = p.angle;
+    d.shade = AerialShade(p.z, depth, fs);
 
     // A resting piece gets one sample however the blur is set: extrapolating a
     // zero velocity would produce identical samples at real cost, and a piece
@@ -49,8 +53,30 @@ void BuildDrawList(const ShatterGeometry& geom, const std::vector<ShardPose>& po
         offset = (u - 0.5f) * shutter;
       }
 
-      const Mat3 fwd = ShardTransform(sh.cx, sh.cy, p.x + p.vx * offset, p.y + p.vy * offset,
-                                      p.angle + p.w * offset, p.scale);
+      // Perspective is evaluated per shutter sample, so a piece rushing at the
+      // camera grows through the smear rather than being smeared at one size.
+      const float zAt = p.z + p.vz * offset;
+      const float persp = PerspectiveScale(zAt, depth, fs);
+
+      Mat3 fwd = ShardTransform(sh.cx, sh.cy, p.x + p.vx * offset, p.y + p.vy * offset,
+                                p.angle + p.w * offset, p.scale * persp);
+
+      // The card flip. Foreshortening a flat piece across an in-plane axis is a
+      // squash in a rotated frame, which is a full 2x2 -- not something the
+      // uniform scale above can express, hence the separate sandwich.
+      //
+      // Clamped away from zero: exactly edge-on the transform is singular, and
+      // Invert would hand back identity, flashing the piece at full size for one
+      // frame in the middle of its flip.
+      if (p.tumble != 0.0f) {
+        const float squash = fabsf(cosf(p.tumble));
+        const Mat3 pivot = Mat3::Translate(sh.cx, sh.cy);
+        const Mat3 unpivot = Mat3::Translate(-sh.cx, -sh.cy);
+        fwd = fwd * pivot * Mat3::Rotate(p.tumbleAxis) *
+              Mat3::Scale(1.0f, squash < 0.02f ? 0.02f : squash) *
+              Mat3::Rotate(-p.tumbleAxis) * unpivot;
+      }
+
       d.inv[s] = Invert(fwd);
 
       // Destination bounds must cover every sample, or the last one gets clipped
@@ -76,6 +102,19 @@ void BuildDrawList(const ShatterGeometry& geom, const std::vector<ShardPose>& po
     if (d.x2 <= d.x1 || d.y2 <= d.y1) continue;  // entirely off frame
     out.push_back(d);
   }
+
+  // Painter's algorithm: furthest first, so nearer pieces cover them. Occlusion
+  // is the strongest depth cue there is -- without it, perspective scaling alone
+  // reads as pieces changing size rather than as pieces moving in depth.
+  //
+  // The tie-break on label keeps the order total. Without it, the thousands of
+  // pieces sitting at z = 0 before the shatter starts would be ordered by
+  // whatever the sort happened to do, and could reorder between frames -- which
+  // shows up as flickering wherever two pieces overlap by a pixel.
+  std::stable_sort(out.begin(), out.end(), [](const ShardDraw& a, const ShardDraw& b) {
+    if (a.z != b.z) return a.z > b.z;
+    return a.label < b.label;
+  });
 }
 
 void BuildTileGrid(const std::vector<ShardDraw>& draws, int width, int height, TileGrid& out) {
@@ -129,6 +168,12 @@ void Composite(const ImageView& dst, const ConstImageView& src, const ShatterGeo
   const SampleView sv = MakeSampleView(src);
   const int32_t* labels = geom.labelImage.data();
 
+  // Null when the bevel is off, which is also how the shading is skipped.
+  const bool haveEdges = params.bevel > 0.0f && geom.edges.valid() &&
+                         geom.edges.width == geom.width && geom.edges.height == geom.height;
+  const uint8_t* eDist = haveEdges ? geom.edges.dist.data() : nullptr;
+  const uint8_t* eAngle = haveEdges ? geom.edges.angle.data() : nullptr;
+
   // Rows are independent because this is a gather: each destination pixel reads
   // and writes only itself, so the banding is invisible in the output.
   ParallelFor(dst.height, [&](int yBegin, int yEnd) {
@@ -149,9 +194,10 @@ void Composite(const ImageView& dst, const ConstImageView& src, const ShatterGeo
         if (lo == hi) continue;
 
         // The identical function the CUDA kernel calls.
-        ShadePixel(labels, geom.width, geom.height, sv, draws.data(), tiles.shardIdx.data(), lo,
-                   hi, x, y, params.edgeAntialias, params.showPieces,
-                   drow + std::size_t(x) * 4);
+        ShadePixel(labels, eDist, eAngle, geom.width, geom.height, sv, draws.data(),
+                   tiles.shardIdx.data(), lo, hi, x, y, params.edgeAntialias,
+                   params.showPieces, haveEdges ? params.bevel : 0.0f, params.bevelWidth,
+                   params.lightX, params.lightY, drow + std::size_t(x) * 4);
       }
     }
   });
