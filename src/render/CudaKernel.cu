@@ -214,7 +214,8 @@ bool CudaUploadLabels(CudaContext* ctx, const std::int32_t* labels, const std::u
   return true;
 }
 
-bool CudaComposite(CudaContext* ctx, const float* devSrc, float* devDst, int width, int height,
+bool CudaComposite(CudaContext* ctx, const float* devSrc, float* devDst, int srcW, int srcH,
+                   int dstW, int dstH,
                    std::ptrdiff_t srcStrideFloats, std::ptrdiff_t dstStrideFloats,
                    const ShardDraw* draws, int drawCount, const std::int32_t* tileStart,
                    int tileCount, const std::int32_t* tileShardIdx, int tileShardCount,
@@ -248,20 +249,22 @@ bool CudaComposite(CudaContext* ctx, const float* devSrc, float* devDst, int wid
                           cudaMemcpyHostToDevice, s)))
     return false;
 
+  // The view describes the SOURCE; the grid covers the DESTINATION. They are the
+  // same size on Resolve's Edit page and different inside a Fusion comp.
   SampleView sv;
   sv.data = devSrc;
-  sv.width = width;
-  sv.height = height;
+  sv.width = srcW;
+  sv.height = srcH;
   sv.rowStrideFloats = int(srcStrideFloats);
 
   const dim3 block(16, 16);
-  const dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+  const dim3 grid((dstW + block.x - 1) / block.x, (dstH + block.y - 1) / block.y);
   const bool bevelOn = params.bevel > 0.0f && ctx->hasEdges;
   kShade<<<grid, block, 0, s>>>(
       static_cast<const int32_t*>(ctx->labels.p),
       bevelOn ? static_cast<const uint8_t*>(ctx->edgeDist.p) : nullptr,
       bevelOn ? static_cast<const uint8_t*>(ctx->edgeAngle.p) : nullptr, ctx->labelW,
-      ctx->labelH, sv, devDst, (long long)dstStrideFloats, width, height,
+      ctx->labelH, sv, devDst, (long long)dstStrideFloats, dstW, dstH,
       static_cast<const ShardDraw*>(ctx->draws.p),
       static_cast<const int32_t*>(ctx->tileStart.p),
       static_cast<const int32_t*>(ctx->tileShardIdx.p), tilesX, tilesY,
@@ -297,7 +300,8 @@ bool CudaCompositeHostSync(const float* hostSrc, float* hostDst, const std::int3
   // fair parity comparison.
   const std::ptrdiff_t stride = std::ptrdiff_t(width) * 4;
   if (!CudaComposite(&ctx, static_cast<const float*>(devSrc.p), static_cast<float*>(devDst.p),
-                     width, height, stride, stride, draws, drawCount, tileStart, tileCount,
+                     width, height, width, height, stride, stride, draws, drawCount, tileStart,
+                     tileCount,
                      tileShardIdx, tileShardCount, tilesX, tilesY, params, nullptr))
     return false;
 

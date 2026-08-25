@@ -61,6 +61,24 @@ struct ShardDraw {
   float angle = 0.0f;  ///< the piece's rotation, for turning the bevel normals
 };
 
+/** @brief Where the destination sits relative to the source.
+ *
+ * On Resolve's Edit page these are the same buffer size and this is all zeros.
+ * Inside a Fusion comp they are not: Fusion crops an input to its domain of
+ * definition, so the source can be smaller than the frame being written and
+ * offset within it. Everything in core works in SOURCE space -- the label image,
+ * the shard centroids, the edge field -- so the destination has to be mapped
+ * into that space rather than assumed to coincide with it.
+ *
+ * Getting this wrong in Fusion does not look like an offset. The source view is
+ * built from the destination's bounds, `getPixelAddress` returns null for a
+ * pixel the source does not have, and the frame comes out black.
+ */
+struct FrameLayout {
+  int dstWidth = 0, dstHeight = 0;  ///< 0 means "same as the source"
+  int offX = 0, offY = 0;           ///< destination (0,0) is source (offX, offY)
+};
+
 struct BlurParams {
   bool enabled = false;
   float shutterAngle = 180.0f;  ///< degrees; 180 means the shutter is open half a frame
@@ -91,7 +109,7 @@ struct CompositeParams {
  * access switched off. */
 void BuildDrawList(const ShatterGeometry& geom, const std::vector<ShardPose>& poses,
                    const BlurParams& blur, const DepthParams& depth, const FrameScale& fs,
-                   std::vector<ShardDraw>& out);
+                   std::vector<ShardDraw>& out, const FrameLayout& layout = FrameLayout{});
 
 /** @brief Bin the draw list into tiles. */
 void BuildTileGrid(const std::vector<ShardDraw>& draws, int width, int height, TileGrid& out);

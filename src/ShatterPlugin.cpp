@@ -213,6 +213,7 @@ class ShatterPhysicsPlugin : public OFX::ImageEffect {
 
   void render(const OFX::RenderArguments& args) override;
   void changedParam(const OFX::InstanceChangedArgs& args, const std::string& name) override;
+  void getClipPreferences(OFX::ClipPreferencesSetter& prefs) override;
 
   // Always false, never conditionally.
   //
@@ -624,10 +625,17 @@ std::shared_ptr<const shp::ShatterGeometry> ShatterPhysicsPlugin::geometryFor(
 // than a crash.
 bool ShatterPhysicsPlugin::renderCuda(const OFX::RenderArguments& args, OFX::Image* src,
                                       OFX::Image* dst, OFX::Image* mapImg) {
-  const OfxRectI bounds = dst->getBounds();
-  const int w = bounds.x2 - bounds.x1;
-  const int h = bounds.y2 - bounds.y1;
-  if (w <= 0 || h <= 0) return false;
+  // Source and destination are sized independently, because in a Fusion comp
+  // they genuinely are: an input cropped to its domain of definition is smaller
+  // than the frame being written. Using the destination's size to read the
+  // source -- which this did -- walks off the end of the source buffer.
+  const OfxRectI dstB = dst->getBounds();
+  const OfxRectI srcB = src->getBounds();
+  const int w = dstB.x2 - dstB.x1;
+  const int h = dstB.y2 - dstB.y1;
+  const int sw = srcB.x2 - srcB.x1;
+  const int sh = srcB.y2 - srcB.y1;
+  if (w <= 0 || h <= 0 || sw <= 0 || sh <= 0) return false;
 
   auto* srcBase = static_cast<const float*>(src->getPixelData());
   auto* dstBase = static_cast<float*>(dst->getPixelData());
@@ -651,12 +659,12 @@ bool ShatterPhysicsPlugin::renderCuda(const OFX::RenderArguments& args, OFX::Ima
   // changed. Without this the CUDA path would download every frame to feed the
   // segmentation and be slower than the CPU path it replaced.
   const uint64_t hash =
-      shp::CudaHashSource(_cuda, srcBase, w, h, srcStride, sp.alphaThreshold, stream);
+      shp::CudaHashSource(_cuda, srcBase, sw, sh, srcStride, sp.alphaThreshold, stream);
 
   std::shared_ptr<const shp::ShatterGeometry> geom;
   {
     std::lock_guard<std::mutex> lock(_cache.mutex);
-    if (_cache.geom && _cache.hash == hash && _cache.width == w && _cache.height == h &&
+    if (_cache.geom && _cache.hash == hash && _cache.width == sw && _cache.height == sh &&
         _cache.params == sp) {
       geom = _cache.geom;
     }
@@ -664,18 +672,18 @@ bool ShatterPhysicsPlugin::renderCuda(const OFX::RenderArguments& args, OFX::Ima
 
   if (!geom) {
     // Cache miss: bring the frame down once and label it on the CPU.
-    _hostFrame.resize(std::size_t(w) * std::size_t(h) * 4);
-    if (!shp::CudaDownload(_cuda, srcBase, w, h, srcStride, _hostFrame.data(), stream))
+    _hostFrame.resize(std::size_t(sw) * std::size_t(sh) * 4);
+    if (!shp::CudaDownload(_cuda, srcBase, sw, sh, srcStride, _hostFrame.data(), stream))
       return false;
 
     // The download is packed bottom-up exactly as the device holds it; this
     // view flips it to the top-down space src/core works in, the same way
     // makeView does for the CPU path.
     shp::ConstImageView hostView;
-    hostView.data = _hostFrame.data() + std::size_t(h - 1) * std::size_t(w) * 4;
-    hostView.width = w;
-    hostView.height = h;
-    hostView.rowStride = -std::ptrdiff_t(w) * 4;
+    hostView.data = _hostFrame.data() + std::size_t(sh - 1) * std::size_t(sw) * 4;
+    hostView.width = sw;
+    hostView.height = sh;
+    hostView.rowStride = -std::ptrdiff_t(sw) * 4;
 
     // A custom map would need its own download; not supported on the GPU path
     // yet, so it falls back to the generated pattern rather than reading device
@@ -687,8 +695,8 @@ bool ShatterPhysicsPlugin::renderCuda(const OFX::RenderArguments& args, OFX::Ima
     _cache.geom = geom;
     _cache.hash = hash;
     _cache.mapHash = 0;
-    _cache.width = w;
-    _cache.height = h;
+    _cache.width = sw;
+    _cache.height = sh;
     _cache.params = sp;
   }
 
@@ -742,8 +750,14 @@ bool ShatterPhysicsPlugin::renderCuda(const OFX::RenderArguments& args, OFX::Ima
   } else {
     shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, dp, float(clipT), _poses);
   }
-  shp::BuildDrawList(*geom, _poses, blur, dp, fs, _draws);
-  shp::BuildTileGrid(_draws, geom->width, geom->height, _tiles);
+  shp::FrameLayout layout;
+  layout.dstWidth = w;
+  layout.dstHeight = h;
+  layout.offX = dstB.x1 - srcB.x1;
+  layout.offY = srcB.y2 - dstB.y2;   // both views are top-down
+
+  shp::BuildDrawList(*geom, _poses, blur, dp, fs, _draws, layout);
+  shp::BuildTileGrid(_draws, w, h, _tiles);
 
   // The label image is 33 MB at 4K, so it is uploaded when the geometry object
   // changes rather than per frame. Pointer identity is the key, for the same
@@ -763,15 +777,47 @@ bool ShatterPhysicsPlugin::renderCuda(const OFX::RenderArguments& args, OFX::Ima
   // Top-down views over the host's bottom-up buffers: point at the last row and
   // negate the stride, exactly as makeView does on the CPU path, so the kernel
   // and the label image agree on which way is up.
-  const float* srcTop = srcBase + (std::size_t(h - 1) * std::size_t(srcStride));
+  const float* srcTop = srcBase + (std::size_t(sh - 1) * std::size_t(srcStride));
   float* dstTop = dstBase + (std::size_t(h - 1) * std::size_t(dstStride));
 
-  return shp::CudaComposite(_cuda, srcTop, dstTop, w, h, -srcStride, -dstStride, _draws.data(),
+  return shp::CudaComposite(_cuda, srcTop, dstTop, sw, sh, w, h, -srcStride, -dstStride,
+                            _draws.data(),
                             int(_draws.size()), _tiles.start.data(), _tiles.tileCount(),
                             _tiles.shardIdx.data(), int(_tiles.shardIdx.size()), _tiles.tilesX,
                             _tiles.tilesY, cp, stream);
 }
 #endif  // SHP_WITH_CUDA
+
+/** @brief Tell the host the picture changes over time, and that it is premultiplied.
+ *
+ * Both of these are about Fusion, and the first is the reason the effect appeared
+ * frozen there.
+ *
+ * Nothing in this plugin is keyframed -- the parameters are constants the
+ * simulation interprets against the render time -- so as far as a host can tell,
+ * nothing about the effect varies. It is then entirely within its rights to
+ * render one frame and reuse it for the whole clip, and Fusion does exactly
+ * that: playback shows a still image while the Inspector goes on updating it
+ * live. Resolve's Edit page happens to re-render regardless, which is why this
+ * went unnoticed there for so long.
+ *
+ * This is the same class of problem as eCacheInvalidateValueAll on every
+ * parameter, and it needs both: one tells the host that an EDIT invalidates
+ * every frame, this one tells it that TIME does.
+ */
+void ShatterPhysicsPlugin::getClipPreferences(OFX::ClipPreferencesSetter& prefs) {
+  prefs.setOutputFrameVarying(true);
+
+  // Always premultiplied, whatever the input claimed.
+  //
+  // The compositor scales all four channels together, so the output genuinely is
+  // premultiplied -- and it always carries alpha, because pieces fly apart and
+  // leave transparent frame behind them. Inheriting an "opaque" declaration from
+  // the input tells everything downstream to ignore that alpha, so a drop shadow
+  // or an outline keyed off the silhouette quietly does nothing.
+  prefs.setOutputPremultiplication(OFX::eImagePreMultiplied);
+  if (_dstClip) prefs.setClipComponents(*_dstClip, OFX::ePixelComponentRGBA);
+}
 
 // ---------------------------------------------------------------------- render
 
@@ -812,11 +858,28 @@ void ShatterPhysicsPlugin::render(const OFX::RenderArguments& args) {
     clearOut();
     return;
   }
-  const shp::ImageView srcView = makeView(src.get(), region);
+
+  // Built from the SOURCE's own bounds, not the destination's.
+  //
+  // On the Edit page they are the same rectangle. Inside a Fusion comp they are
+  // not: Fusion crops an input to its domain of definition, so asking the source
+  // for a pixel addressed in destination coordinates gets a null back and the
+  // whole frame comes out black. Fusion is also documented to fail this three
+  // ways in turn while scrubbing -- a null image, then a zero-sized one, then
+  // one with no data behind it -- which is what the validity check below covers.
+  const OfxRectI srcB = src->getBounds();
+  const shp::ImageView srcView = makeView(src.get(), srcB);
   if (!srcView.valid()) {
     clearOut();
     return;
   }
+
+  // Where the destination sits inside the source. Zero on the Edit page.
+  shp::FrameLayout layout;
+  layout.dstWidth = dstView.width;
+  layout.dstHeight = dstView.height;
+  layout.offX = region.x1 - srcB.x1;
+  layout.offY = srcB.y2 - region.y2;   // both views are top-down
 
   // Never write parameters from here. Render runs on host worker threads outside
   // any edit block, and a host that dispatches the resulting changedParam back
@@ -889,8 +952,11 @@ void ShatterPhysicsPlugin::render(const OFX::RenderArguments& args) {
   } else {
     shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, dp, float(clipT), _poses);
   }
-  shp::BuildDrawList(*geom, _poses, blur, dp, fs, _draws);
-  shp::BuildTileGrid(_draws, geom->width, geom->height, _tiles);
+  shp::BuildDrawList(*geom, _poses, blur, dp, fs, _draws, layout);
+  // Tiles are indexed in DESTINATION space, since that is what the pixel loop
+  // walks. Sizing them from the source would leave the far edge of a larger
+  // destination in no tile at all, and therefore unwritten.
+  shp::BuildTileGrid(_draws, dstView.width, dstView.height, _tiles);
   shp::Composite(dstView, srcView, *geom, _draws, _tiles, cp);
 }
 

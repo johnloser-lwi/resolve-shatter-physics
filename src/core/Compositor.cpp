@@ -10,7 +10,12 @@ namespace shp {
 
 void BuildDrawList(const ShatterGeometry& geom, const std::vector<ShardPose>& poses,
                    const BlurParams& blur, const DepthParams& depth, const FrameScale& fs,
-                   std::vector<ShardDraw>& out) {
+                   std::vector<ShardDraw>& out, const FrameLayout& layout) {
+  // A layout with no size means the destination is the source, which is what
+  // Resolve's Edit page always hands over and what the offline harness uses.
+  const int dstW = layout.dstWidth > 0 ? layout.dstWidth : geom.width;
+  const int dstH = layout.dstHeight > 0 ? layout.dstHeight : geom.height;
+  const bool shifted = layout.offX != 0 || layout.offY != 0;
   out.clear();
   out.reserve(geom.shards.size());
 
@@ -79,6 +84,12 @@ void BuildDrawList(const ShatterGeometry& geom, const std::vector<ShardPose>& po
 
       d.inv[s] = Invert(fwd);
 
+      // The transform above works entirely in SOURCE space. Pre-translating by
+      // the layout offset lets the pixel loop keep counting from the
+      // destination's own origin, which is the only coordinate it has.
+      if (shifted)
+        d.inv[s] = d.inv[s] * Mat3::Translate(float(layout.offX), float(layout.offY));
+
       // Destination bounds must cover every sample, or the last one gets clipped
       // and the blur ends in a hard edge.
       for (int c = 0; c < 4; ++c) {
@@ -94,10 +105,12 @@ void BuildDrawList(const ShatterGeometry& geom, const std::vector<ShardPose>& po
     // Grown by one pixel because the bilinear tap of an edge pixel reaches half
     // a pixel past it, and by another because the stencil is tested at pixel
     // centres.
-    d.x1 = std::max(0, int(std::floor(minX)) - 2);
-    d.y1 = std::max(0, int(std::floor(minY)) - 2);
-    d.x2 = std::min(geom.width, int(std::ceil(maxX)) + 2);
-    d.y2 = std::min(geom.height, int(std::ceil(maxY)) + 2);
+    // The bounds came out in source space too, so they move the other way
+    // before being clipped against the destination.
+    d.x1 = std::max(0, int(std::floor(minX)) - 2 - layout.offX);
+    d.y1 = std::max(0, int(std::floor(minY)) - 2 - layout.offY);
+    d.x2 = std::min(dstW, int(std::ceil(maxX)) + 2 - layout.offX);
+    d.y2 = std::min(dstH, int(std::ceil(maxY)) + 2 - layout.offY);
 
     if (d.x2 <= d.x1 || d.y2 <= d.y1) continue;  // entirely off frame
     out.push_back(d);

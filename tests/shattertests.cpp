@@ -1010,6 +1010,100 @@ void testEdgeField() {
   check(turned < 1.0f, "turning a piece over swaps its lit and shadowed edges");
 }
 
+// A destination that is not the same rectangle as the source.
+//
+// Resolve's Edit page always hands over matching buffers, so nothing else in
+// this suite exercises the offset -- but inside a Fusion comp an input cropped
+// to its domain of definition is smaller than the frame being written, and
+// everything in core works in SOURCE space. This is the one property that
+// cannot be checked in Resolve at all, which is exactly why it is checked here.
+void testFrameLayout() {
+  const TestImage img = makeDiscs();
+  shp::ShapeParams sp;
+  sp.pattern = shp::Pattern::Alpha;
+  auto geom = shp::buildGeometry(img.view(), nullptr, sp);
+  const shp::FrameScale fs = scaleOf(*geom);
+
+  shp::ForceParams fp;
+  fp.f1.enabled = true;
+  fp.f1.strength = 0.0f;   // nothing moves: this is about coordinates, not motion
+  shp::PhysicsParams pp;
+  pp.gravity = 0.0f;
+  shp::RenderParams rp;
+
+  std::vector<shp::ShardPose> poses;
+  shp::EvaluateBallistic(geom->shards, fp, pp, rp, fs, noDepth, 0.0f, poses);
+
+  shp::CompositeParams cp;
+  cp.edgeAntialias = false;
+
+  auto renderWith = [&](const shp::FrameLayout& layout, TestImage& out) {
+    std::vector<shp::ShardDraw> draws;
+    shp::BuildDrawList(*geom, poses, shp::BlurParams{}, noDepth, fs, draws, layout);
+    shp::TileGrid tiles;
+    const int dw = layout.dstWidth > 0 ? layout.dstWidth : img.w;
+    const int dh = layout.dstHeight > 0 ? layout.dstHeight : img.h;
+    shp::BuildTileGrid(draws, dw, dh, tiles);
+    out.w = dw;
+    out.h = dh;
+    out.px.assign(std::size_t(dw) * std::size_t(dh) * 4, 0.0f);
+    shp::Composite(out.mutableView(), img.view(), *geom, draws, tiles, cp);
+  };
+
+  // A default layout must behave exactly as before it existed.
+  TestImage plain;
+  renderWith(shp::FrameLayout{}, plain);
+  double worst = 0.0;
+  std::size_t claimed = 0;
+  for (std::size_t p = 0; p < geom->labelImage.size(); ++p) {
+    if (geom->labelImage[p] == 0) continue;
+    ++claimed;
+    for (int c = 0; c < 4; ++c)
+      worst = std::max(worst, std::fabs(double(plain.px[p * 4 + std::size_t(c)]) -
+                                        double(img.px[p * 4 + std::size_t(c)])));
+  }
+  check(claimed > 0 && worst < 1e-4, "a default layout renders exactly as before");
+
+  // Now a destination shifted 20 right and 12 down inside the source. The same
+  // picture must come back, moved by exactly that much.
+  shp::FrameLayout shifted;
+  shifted.dstWidth = img.w;
+  shifted.dstHeight = img.h;
+  shifted.offX = 20;
+  shifted.offY = 12;
+
+  TestImage moved;
+  renderWith(shifted, moved);
+
+  double shiftWorst = 0.0;
+  std::size_t compared = 0;
+  for (int y = 0; y + 12 < img.h; ++y) {
+    for (int x = 0; x + 20 < img.w; ++x) {
+      const std::size_t srcP = std::size_t(y + 12) * std::size_t(img.w) + std::size_t(x + 20);
+      if (geom->labelImage[srcP] == 0) continue;
+      const std::size_t dstP = std::size_t(y) * std::size_t(img.w) + std::size_t(x);
+      ++compared;
+      for (int c = 0; c < 4; ++c)
+        shiftWorst = std::max(shiftWorst,
+                              std::fabs(double(moved.px[dstP * 4 + std::size_t(c)]) -
+                                        double(img.px[srcP * 4 + std::size_t(c)])));
+    }
+  }
+  check(compared > 0 && shiftWorst < 1e-4,
+        "an offset destination samples the right part of the source");
+
+  // And a destination LARGER than the source must not read off the end of it.
+  shp::FrameLayout bigger;
+  bigger.dstWidth = img.w + 64;
+  bigger.dstHeight = img.h + 48;
+  TestImage large;
+  renderWith(bigger, large);
+  bool finite = true;
+  for (float v : large.px)
+    if (!(v == v) || v < -1e3f || v > 1e3f) finite = false;
+  check(finite, "a destination larger than the source stays in bounds");
+}
+
 // Changing a render-only control must NOT invalidate the simulation, or every
 // fade tweak would re-run the physics.
 void testFadeDoesNotInvalidateSim() {
@@ -1275,6 +1369,7 @@ int main() {
   testRotateHandle();
   testDepth();
   testEdgeField();
+  testFrameLayout();
   testFadeDoesNotInvalidateSim();
   testPiecesRestOnFloor();
   testRestFrameReproducesSource();

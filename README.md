@@ -396,6 +396,45 @@ a machine with no CUDA device.
 download, and reading a device pointer on the host is a crash rather than a
 glitch. It falls back to the generated pattern.
 
+## Running inside Fusion
+
+Resolve's Edit page is forgiving in ways a Fusion comp is not, and three of its
+habits will hide a bug completely.
+
+**The output must be declared frame-varying.** Nothing here is keyframed -- the
+parameters are constants the simulation interprets against the render time -- so
+as far as a host can tell, nothing about the effect varies with time. It is then
+entirely within its rights to render one frame and reuse it for the whole clip,
+and Fusion does exactly that: playback shows a still image while the Inspector
+goes on updating it live. `getClipPreferences` sets
+`setOutputFrameVarying(true)`.
+
+This is the same class of problem as `eCacheInvalidateValueAll`, and it needs
+both: one tells the host that an EDIT invalidates every frame, the other that
+TIME does.
+
+**The source is not the same rectangle as the destination.** Fusion crops an
+input to its domain of definition, so the source can be smaller than the frame
+being written and offset within it. Everything under `src/core` works in SOURCE
+space -- the label image, the shard centroids, the edge field -- so the
+destination is mapped into that space through `FrameLayout` rather than assumed
+to coincide with it. Build the source view from the *destination's* bounds and
+`getPixelAddress` returns null for a pixel the source does not have, which comes
+out as a black frame. On the CUDA path the same mistake reads off the end of the
+source buffer.
+
+**The output is premultiplied and always carries alpha.** Pieces fly apart and
+leave transparent frame behind them, so inheriting an "opaque" declaration from
+the input tells everything downstream to ignore that alpha -- and a drop shadow
+or outline keyed off the silhouette quietly does nothing.
+
+Timing needs no special handling, but only because it was designed around the
+problem: everything is in frames (Fusion does not publish a frame rate and the
+Support library throws on a missing property), and `toClipTime` subtracts the
+reported clip start, which measures correctly both for a Resolve effect --
+`t1=86381, args.time=86401` -- and inside a comp, where the render time is
+already the composition's own small range.
+
 ## Notes for anyone changing this
 
 **Tiling is off and must stay off.** Both the alpha segmentation and the cell

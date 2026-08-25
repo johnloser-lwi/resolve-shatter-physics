@@ -81,7 +81,12 @@ bool CudaUploadLabels(CudaContext* ctx, const std::int32_t* labels, const std::u
 ///
 /// @param devSrc,devDst point at the TOP row with a NEGATIVE stride, matching
 ///        the top-down convention src/core works in.
-bool CudaComposite(CudaContext* ctx, const float* devSrc, float* devDst, int width, int height,
+/// @param srcW,srcH  the source's own size, which in a Fusion comp is NOT the
+///        destination's -- an input cropped to its domain of definition is
+///        smaller than the frame being written.
+/// @param dstW,dstH  what the kernel grid covers.
+bool CudaComposite(CudaContext* ctx, const float* devSrc, float* devDst, int srcW, int srcH,
+                   int dstW, int dstH,
                    std::ptrdiff_t srcStrideFloats, std::ptrdiff_t dstStrideFloats,
                    const ShardDraw* draws, int drawCount, const std::int32_t* tileStart,
                    int tileCount, const std::int32_t* tileShardIdx, int tileShardCount,
