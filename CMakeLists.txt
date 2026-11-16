@@ -29,6 +29,12 @@ add_library(shp_core STATIC
 target_include_directories(shp_core PUBLIC src src/core)
 if(MSVC)
   target_compile_options(shp_core PRIVATE /W4 /fp:fast)
+else()
+  # Deliberately no -ffast-math to pair with MSVC's /fp:fast. The determinism
+  # the simulation needs is run-to-run on ONE machine, which plain IEEE gives
+  # for free, and fast-math is entitled to assume no NaNs -- which would quietly
+  # delete the guards that keep one bad centroid from poisoning a cached run.
+  target_compile_options(shp_core PRIVATE -Wall -Wextra)
 endif()
 
 # ------------------------------------------------------------------- OFX plugin
@@ -105,11 +111,34 @@ else()
 endif()
 
 # Assemble the .ofx.bundle next to the binary.
-set(BUNDLE ${CMAKE_BINARY_DIR}/bundle/ShatterPhysics.ofx.bundle/Contents/Win64)
+#
+# The architecture directory is part of the OFX spec and the host will not look
+# anywhere else, so it is not a cosmetic path: a macOS build dropped into Win64
+# simply never loads, with no error to explain why.
+#
+# Apple Silicon has no directory of its own in the spec -- a Mach-O binary
+# carries its own architecture, so arm64 and universal builds both live in
+# Contents/MacOS.
+if(APPLE)
+  set(OFX_ARCH_DIR MacOS)
+elseif(WIN32)
+  set(OFX_ARCH_DIR Win64)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  set(OFX_ARCH_DIR Linux-arm-64)
+else()
+  set(OFX_ARCH_DIR Linux-x86-64)
+endif()
+
+set(BUNDLE_ROOT ${CMAKE_BINARY_DIR}/bundle/ShatterPhysics.ofx.bundle/Contents)
+set(BUNDLE ${BUNDLE_ROOT}/${OFX_ARCH_DIR})
 add_custom_command(TARGET ShatterPhysics POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory ${BUNDLE}
   COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:ShatterPhysics> ${BUNDLE}/ShatterPhysics.ofx
-  COMMENT "Assembling ShatterPhysics.ofx.bundle"
+  # Required on macOS, where a bundle without it is not a bundle. Harmless
+  # elsewhere, and the siblings ship it on every platform for that reason.
+  COMMAND ${CMAKE_COMMAND} -E copy
+          ${CMAKE_CURRENT_SOURCE_DIR}/packaging/Info.plist ${BUNDLE_ROOT}/Info.plist
+  COMMENT "Assembling ShatterPhysics.ofx.bundle (${OFX_ARCH_DIR})"
 )
 
 # ---------------------------------------------------------------- test harness

@@ -14,7 +14,9 @@ alpha, or from the alpha itself, one connected region per piece.
 ## Requirements
 
 DaVinci Resolve **Studio**. The free version refuses third-party OFX plugins.
-Windows, Visual Studio 18 with a C++ toolset.
+
+Windows with Visual Studio 18, or macOS/Linux with any C++17 compiler -- see
+*macOS and Linux* below.
 
 A CUDA toolkit is optional: without it the plugin still builds and runs entirely
 on the CPU. With it, compositing runs on the GPU and frames stay resident on the
@@ -395,6 +397,57 @@ a machine with no CUDA device.
 `Custom Map` is not supported on the GPU path yet: the map would need its own
 download, and reading a device pointer on the host is a crash rather than a
 glitch. It falls back to the generated pattern.
+
+## macOS and Linux
+
+The plugin is portable C++17 and builds CPU-only without CUDA. There is no
+Windows-specific code anywhere under `src` -- no platform headers, no MSVC
+pragmas, no x86 intrinsics -- and every MSVC compiler flag is behind `if(MSVC)`.
+
+```bash
+git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git external/openfx
+./build.sh
+./install.sh            # /Library/OFX/Plugins on macOS, /usr/OFX/Plugins elsewhere
+```
+
+On Apple Silicon this produces an arm64 binary, which is what Resolve is. Pass
+`-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"` for a universal one.
+
+Two things are genuinely platform-bound and are handled in CMake rather than by
+hand:
+
+- **The architecture directory inside the bundle is part of the OFX spec** and
+  the host will not look anywhere else. A macOS build dropped into `Win64`
+  simply never loads, with nothing to explain why. Apple Silicon has no
+  directory of its own in the spec -- a Mach-O carries its own architecture, so
+  arm64 and universal builds both live in `Contents/MacOS`.
+- **macOS needs `Info.plist`**; a bundle without one is not a bundle. It is
+  copied on every platform, which is harmless and matches the siblings.
+
+`-ffast-math` is deliberately NOT set to pair with MSVC's `/fp:fast`. The
+determinism the simulation needs is run-to-run on one machine, which plain IEEE
+gives for free, and fast-math is entitled to assume no NaNs -- which would
+quietly delete the guards that keep one bad centroid from poisoning a cached run.
+
+### Why there is no Metal path
+
+Nothing requires one: the CPU path is complete, and `CudaAvailable()` is simply
+false, so CUDA support is never declared to the host and the plugin renders on
+the CPU exactly as it does on a Windows machine without a GPU.
+
+What it costs is the same thing described under *The GPU path*: Resolve on macOS
+is GPU-resident too, so every frame is copied off the card and back. Expect
+comfortable interactive work at 1080p and slower-than-realtime playback at 4K.
+Rendering is unaffected -- only playback.
+
+A Metal port would be meaningfully harder than the CUDA one was, and for a
+specific reason worth knowing before starting. CUDA is C++, so `SHP_HD` let the
+kernel call the *same* `ShadePixel` the CPU path calls and the parity test
+merely confirms what the compiler already guarantees. Metal Shading Language is
+a separate source language: `core/Compositor.h` cannot simply be included, so
+the shading would have to be reimplemented in MSL. That breaks the "the kernel
+contains no maths" rule this codebase leans on, and the parity test stops being
+a formality and becomes the only thing holding the two in agreement.
 
 ## Running inside Fusion
 
