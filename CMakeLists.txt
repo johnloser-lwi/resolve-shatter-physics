@@ -1,4 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
+
+# Must precede project(). macOS 12 is older than any Resolve that loads Metal
+# OFX plugins, so it costs nothing and keeps the bundle loadable on older
+# machines; the newer Metal API the plugin uses is behind @available.
+set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum macOS version")
+
 project(ResolveShatterPhysics VERSION 1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -60,6 +66,15 @@ target_include_directories(ShatterPhysics PRIVATE
 )
 set_target_properties(ShatterPhysics PROPERTIES PREFIX "" SUFFIX ".ofx")
 
+if(NOT MSVC)
+  # Export only the OFX entry points (marked OfxExport), which is what a Windows
+  # DLL does by default. Otherwise every OFX Support and core symbol is public,
+  # and a host that loads several plugins built on the same Support library
+  # sees hundreds of identically named C++ symbols from each of them.
+  set_target_properties(ShatterPhysics shp_core PROPERTIES
+    CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+endif()
+
 if(MSVC)
   # Static CRT: an OFX bundle is loaded by a host that will not have our
   # redistributables, and a missing VCRUNTIME dll fails as a silent no-load --
@@ -108,6 +123,44 @@ if(CMAKE_CUDA_COMPILER)
 else()
   target_compile_definitions(ShatterPhysics PRIVATE SHP_WITH_CUDA=0)
   message(STATUS "CUDA toolkit not found - building CPU-only")
+endif()
+
+# ------------------------------------------------------------------ Metal path
+# macOS only. Unlike CUDA there is no toolkit to look for: Metal ships with the
+# OS, so every Mac build has it, and the plugin decides at load time whether to
+# claim it (MetalAvailable() needs a device AND a kernel that compiled).
+#
+# The kernel is NOT compiled here. The offline `metal` compiler comes only with
+# full Xcode, not the Command Line Tools, so MetalKernel.metal is embedded into
+# the binary as a string and compiled by the Metal framework on first use.
+if(APPLE)
+  enable_language(OBJCXX)
+
+  # Embedded at BUILD time, so editing the kernel always recompiles the host
+  # code that carries it -- see cmake/EmbedText.cmake for why not at configure.
+  set(SHP_METAL_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/render/MetalKernel.metal)
+  set(SHP_METAL_HDR ${CMAKE_BINARY_DIR}/generated/MetalKernelSource.h)
+  add_custom_command(
+    OUTPUT ${SHP_METAL_HDR}
+    COMMAND ${CMAKE_COMMAND} -DIN=${SHP_METAL_SRC} -DOUT=${SHP_METAL_HDR}
+            -DSYMBOL=kMetalKernelSource -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedText.cmake
+    DEPENDS ${SHP_METAL_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedText.cmake
+    COMMENT "Embedding MetalKernel.metal"
+    VERBATIM)
+
+  # Its own static library for the same reason as shp_cuda: the plugin and the
+  # parity test link the SAME compiled host code and the same embedded kernel.
+  add_library(shp_metal STATIC src/render/MetalRender.mm ${SHP_METAL_HDR})
+  target_include_directories(shp_metal PUBLIC src src/core
+                             PRIVATE ${CMAKE_BINARY_DIR}/generated)
+  target_compile_options(shp_metal PRIVATE -fobjc-arc -Wall -Wextra)
+  target_compile_definitions(shp_metal PUBLIC SHP_WITH_METAL=1)
+  target_link_libraries(shp_metal PUBLIC "-framework Metal" "-framework Foundation")
+  set_target_properties(shp_metal PROPERTIES
+    CXX_VISIBILITY_PRESET hidden OBJCXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+
+  target_link_libraries(ShatterPhysics PRIVATE shp_metal)
+  message(STATUS "Metal enabled")
 endif()
 
 # Assemble the .ofx.bundle next to the binary.
@@ -182,5 +235,14 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/shattertests.cpp)
       target_compile_definitions(paritytest PRIVATE _CRT_SECURE_NO_WARNINGS)
     endif()
     add_test(NAME cpu_gpu_parity COMMAND paritytest)
+  endif()
+
+  # CPU-vs-Metal parity. Unlike the CUDA one this is the only thing keeping the
+  # two in agreement, because the Metal kernel is a port rather than the shared
+  # ShadePixel -- see src/render/MetalRender.h.
+  if(APPLE AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/metalparity.cpp)
+    add_executable(metalparity tests/metalparity.cpp)
+    target_link_libraries(metalparity PRIVATE shp_core shp_metal)
+    add_test(NAME cpu_metal_parity COMMAND metalparity)
   endif()
 endif()

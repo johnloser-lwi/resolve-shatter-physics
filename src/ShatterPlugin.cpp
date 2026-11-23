@@ -24,8 +24,16 @@
 #include "core/SimCache.h"
 #include "interact/Overlay.h"
 
+#ifndef SHP_WITH_METAL
+#define SHP_WITH_METAL 0
+#endif
+#define SHP_WITH_GPU (SHP_WITH_CUDA || SHP_WITH_METAL)
+
 #if SHP_WITH_CUDA
 #include "render/CudaRender.h"
+#endif
+#if SHP_WITH_METAL
+#include "render/MetalRender.h"
 #endif
 
 #define kPluginName "Shatter Physics"
@@ -108,6 +116,30 @@ shp::ImageView makeView(OFX::Image* img, const OfxRectI& region) {
   return v;
 }
 
+#if SHP_WITH_GPU
+/** @brief The steps of a GPU frame that differ between CUDA and Metal.
+ *
+ * Everything else -- the analysis cache, the simulation, the draw list, the
+ * Fusion layout -- is ShatterPhysicsPlugin::renderGpu, one body for both APIs,
+ * so a fix to how a GPU frame is assembled cannot land in one and miss the
+ * other. Each implementation wraps the host's images for one render call.
+ */
+struct GpuFrame {
+  virtual ~GpuFrame() = default;
+  /// Content fingerprint computed on the device; 0 means "no answer".
+  virtual uint64_t hashSource(float threshold) = 0;
+  /// Device -> host, tightly packed and bottom-up, for the CPU segmentation.
+  virtual bool download(float* hostDst) = 0;
+  virtual bool uploadLabels(const int32_t* labels, const uint8_t* eDist, const uint8_t* eAngle,
+                            int width, int height) = 0;
+  virtual bool composite(const std::vector<shp::ShardDraw>& draws, const shp::TileGrid& tiles,
+                         const shp::CompositeParams& cp) = 0;
+  /// Transparent output for a frame with nothing to draw. False where the
+  /// backend cannot, which leaves the destination as the host handed it over.
+  virtual bool clear() { return false; }
+};
+#endif
+
 // Re-shattering every frame would be wasteful while scrubbing a static title, so
 // keep the last result and reuse it when the input and the shape settings match.
 //
@@ -128,6 +160,9 @@ class ShatterPhysicsPlugin : public OFX::ImageEffect {
   ~ShatterPhysicsPlugin() override {
 #if SHP_WITH_CUDA
     if (_cuda) shp::CudaDestroy(_cuda);
+#endif
+#if SHP_WITH_METAL
+    if (_metal) shp::MetalDestroy(_metal);
 #endif
   }
 
@@ -330,11 +365,20 @@ class ShatterPhysicsPlugin : public OFX::ImageEffect {
   std::vector<shp::ShardDraw> _draws;
   shp::TileGrid _tiles;
 
+#if SHP_WITH_GPU
+  bool renderGpu(const OFX::RenderArguments& args, const OfxRectI& srcB, const OfxRectI& dstB,
+                 GpuFrame& gpu);
+#endif
 #if SHP_WITH_CUDA
   bool renderCuda(const OFX::RenderArguments& args, OFX::Image* src, OFX::Image* dst,
                   OFX::Image* mapImg);
-
   shp::CudaContext* _cuda = nullptr;
+#endif
+#if SHP_WITH_METAL
+  bool renderMetal(const OFX::RenderArguments& args, OFX::Image* src, OFX::Image* dst);
+  shp::MetalContext* _metal = nullptr;
+#endif
+#if SHP_WITH_GPU
   /// Host copy of the frame, downloaded only when the device-side hash says the
   /// content changed. Segmentation is a serial CPU job, so it needs real pixels.
   std::vector<float> _hostFrame;
@@ -615,51 +659,34 @@ std::shared_ptr<const shp::ShatterGeometry> ShatterPhysicsPlugin::geometryFor(
   return geom;
 }
 
-#if SHP_WITH_CUDA
-// The CUDA path.
+#if SHP_WITH_GPU
+// The GPU path, shared by CUDA and Metal.
 //
-// By the time this is called the host has handed over DEVICE pointers, so
-// nothing here may dereference a pixel on the CPU. There is deliberately no
-// fallback to the CPU loop on failure: the addresses are already device memory
-// and the CPU cannot touch them, so a failure has to be a black frame rather
-// than a crash.
-bool ShatterPhysicsPlugin::renderCuda(const OFX::RenderArguments& args, OFX::Image* src,
-                                      OFX::Image* dst, OFX::Image* mapImg) {
-  // Source and destination are sized independently, because in a Fusion comp
-  // they genuinely are: an input cropped to its domain of definition is smaller
-  // than the frame being written. Using the destination's size to read the
-  // source -- which this did -- walks off the end of the source buffer.
-  const OfxRectI dstB = dst->getBounds();
-  const OfxRectI srcB = src->getBounds();
+// By the time this is called the host has handed over DEVICE memory, so nothing
+// here may dereference a pixel on the CPU. There is deliberately no fallback to
+// the CPU loop on failure: the addresses are already device memory (or, on
+// Metal, buffer objects) and the CPU cannot touch them, so a failure has to be a
+// black frame rather than a crash.
+//
+// Source and destination are sized independently, because in a Fusion comp
+// they genuinely are: an input cropped to its domain of definition is smaller
+// than the frame being written.
+bool ShatterPhysicsPlugin::renderGpu(const OFX::RenderArguments& args, const OfxRectI& srcB,
+                                     const OfxRectI& dstB, GpuFrame& gpu) {
   const int w = dstB.x2 - dstB.x1;
   const int h = dstB.y2 - dstB.y1;
   const int sw = srcB.x2 - srcB.x1;
   const int sh = srcB.y2 - srcB.y1;
   if (w <= 0 || h <= 0 || sw <= 0 || sh <= 0) return false;
 
-  auto* srcBase = static_cast<const float*>(src->getPixelData());
-  auto* dstBase = static_cast<float*>(dst->getPixelData());
-  if (!srcBase || !dstBase) return false;
-
-  const std::ptrdiff_t srcStride =
-      std::ptrdiff_t(src->getRowBytes()) / std::ptrdiff_t(sizeof(float));
-  const std::ptrdiff_t dstStride =
-      std::ptrdiff_t(dst->getRowBytes()) / std::ptrdiff_t(sizeof(float));
-  if (srcStride == 0 || dstStride == 0) return false;
-
-  void* stream = args.pCudaStream;
-  if (!_cuda) _cuda = shp::CudaCreate();
-  if (!_cuda) return false;
-
   const double t = args.time;
   const shp::ShapeParams sp = readShape(t);
 
   // The fingerprint is computed ON THE DEVICE and read back as eight bytes, so
   // the 133 MB frame only crosses the bus when the content has actually
-  // changed. Without this the CUDA path would download every frame to feed the
+  // changed. Without this the GPU path would download every frame to feed the
   // segmentation and be slower than the CPU path it replaced.
-  const uint64_t hash =
-      shp::CudaHashSource(_cuda, srcBase, sw, sh, srcStride, sp.alphaThreshold, stream);
+  const uint64_t hash = gpu.hashSource(sp.alphaThreshold);
 
   std::shared_ptr<const shp::ShatterGeometry> geom;
   {
@@ -673,8 +700,7 @@ bool ShatterPhysicsPlugin::renderCuda(const OFX::RenderArguments& args, OFX::Ima
   if (!geom) {
     // Cache miss: bring the frame down once and label it on the CPU.
     _hostFrame.resize(std::size_t(sw) * std::size_t(sh) * 4);
-    if (!shp::CudaDownload(_cuda, srcBase, sw, sh, srcStride, _hostFrame.data(), stream))
-      return false;
+    if (!gpu.download(_hostFrame.data())) return false;
 
     // The download is packed bottom-up exactly as the device holds it; this
     // view flips it to the top-down space src/core works in, the same way
@@ -688,7 +714,6 @@ bool ShatterPhysicsPlugin::renderCuda(const OFX::RenderArguments& args, OFX::Ima
     // A custom map would need its own download; not supported on the GPU path
     // yet, so it falls back to the generated pattern rather than reading device
     // memory on the host.
-    (void)mapImg;
     geom = shp::buildGeometry(hostView, nullptr, sp);
 
     std::lock_guard<std::mutex> lock(_cache.mutex);
@@ -700,7 +725,9 @@ bool ShatterPhysicsPlugin::renderCuda(const OFX::RenderArguments& args, OFX::Ima
     _cache.params = sp;
   }
 
-  if (!geom || geom->empty()) return false;
+  // Nothing to draw is a transparent frame, as on the CPU path -- where the
+  // backend can write one.
+  if (!geom || geom->empty()) return gpu.clear();
 
   const shp::ForceParams fp = readForces(t);
   const shp::PhysicsParams pp = readPhysics(t);
@@ -716,7 +743,7 @@ bool ShatterPhysicsPlugin::renderCuda(const OFX::RenderArguments& args, OFX::Ima
     _bevelWidth->getValueAtTime(t, d);
     // A percentage of frame height, so the pieces look equally thick whatever
     // the timeline resolution.
-    cp.bevelWidth = float(d * 0.01) * float(dst->getBounds().y2 - dst->getBounds().y1);
+    cp.bevelWidth = float(d * 0.01) * float(h);
     _lightAngle->getValueAtTime(t, d);
     const float a = float(d) * shp::kPi / 180.0f;
     // Top-down space, matching gravity's convention: 0 is from above.
@@ -766,27 +793,144 @@ bool ShatterPhysicsPlugin::renderCuda(const OFX::RenderArguments& args, OFX::Ima
   if (_devLabelsFor != geom.get()) {
     const bool haveEdges = geom->edges.valid() && geom->edges.width == geom->width &&
                            geom->edges.height == geom->height;
-    if (!shp::CudaUploadLabels(_cuda, geom->labelImage.data(),
-                               haveEdges ? geom->edges.dist.data() : nullptr,
-                               haveEdges ? geom->edges.angle.data() : nullptr, geom->width,
-                               geom->height, stream))
+    if (!gpu.uploadLabels(geom->labelImage.data(),
+                          haveEdges ? geom->edges.dist.data() : nullptr,
+                          haveEdges ? geom->edges.angle.data() : nullptr, geom->width,
+                          geom->height))
       return false;
     _devLabelsFor = geom.get();
   }
 
-  // Top-down views over the host's bottom-up buffers: point at the last row and
-  // negate the stride, exactly as makeView does on the CPU path, so the kernel
-  // and the label image agree on which way is up.
-  const float* srcTop = srcBase + (std::size_t(sh - 1) * std::size_t(srcStride));
-  float* dstTop = dstBase + (std::size_t(h - 1) * std::size_t(dstStride));
+  return gpu.composite(_draws, _tiles, cp);
+}
+#endif  // SHP_WITH_GPU
 
-  return shp::CudaComposite(_cuda, srcTop, dstTop, sw, sh, w, h, -srcStride, -dstStride,
-                            _draws.data(),
-                            int(_draws.size()), _tiles.start.data(), _tiles.tileCount(),
-                            _tiles.shardIdx.data(), int(_tiles.shardIdx.size()), _tiles.tilesX,
-                            _tiles.tilesY, cp, stream);
+#if SHP_WITH_CUDA
+namespace {
+
+/// CUDA device pointers, bottom-up with positive strides as the host hands
+/// them over. The top-down flip happens at the composite call.
+struct CudaFrame final : GpuFrame {
+  shp::CudaContext* ctx = nullptr;
+  void* stream = nullptr;
+  const float* srcBase = nullptr;
+  float* dstBase = nullptr;
+  std::ptrdiff_t srcStride = 0, dstStride = 0;
+  int sw = 0, sh = 0, w = 0, h = 0;
+
+  uint64_t hashSource(float threshold) override {
+    return shp::CudaHashSource(ctx, srcBase, sw, sh, srcStride, threshold, stream);
+  }
+  bool download(float* hostDst) override {
+    return shp::CudaDownload(ctx, srcBase, sw, sh, srcStride, hostDst, stream);
+  }
+  bool uploadLabels(const int32_t* labels, const uint8_t* eDist, const uint8_t* eAngle,
+                    int width, int height) override {
+    return shp::CudaUploadLabels(ctx, labels, eDist, eAngle, width, height, stream);
+  }
+  bool composite(const std::vector<shp::ShardDraw>& draws, const shp::TileGrid& tiles,
+                 const shp::CompositeParams& cp) override {
+    // Top-down views over the host's bottom-up buffers: point at the last row
+    // and negate the stride, exactly as makeView does on the CPU path, so the
+    // kernel and the label image agree on which way is up.
+    const float* srcTop = srcBase + (std::size_t(sh - 1) * std::size_t(srcStride));
+    float* dstTop = dstBase + (std::size_t(h - 1) * std::size_t(dstStride));
+    return shp::CudaComposite(ctx, srcTop, dstTop, sw, sh, w, h, -srcStride, -dstStride,
+                              draws.data(), int(draws.size()), tiles.start.data(),
+                              tiles.tileCount(), tiles.shardIdx.data(),
+                              int(tiles.shardIdx.size()), tiles.tilesX, tiles.tilesY, cp,
+                              stream);
+  }
+};
+
+}  // namespace
+
+bool ShatterPhysicsPlugin::renderCuda(const OFX::RenderArguments& args, OFX::Image* src,
+                                      OFX::Image* dst, OFX::Image* mapImg) {
+  (void)mapImg;  // see renderGpu: the GPU path does not read the map yet
+  const OfxRectI dstB = dst->getBounds();
+  const OfxRectI srcB = src->getBounds();
+
+  CudaFrame f;
+  f.w = dstB.x2 - dstB.x1;
+  f.h = dstB.y2 - dstB.y1;
+  f.sw = srcB.x2 - srcB.x1;
+  f.sh = srcB.y2 - srcB.y1;
+  f.srcBase = static_cast<const float*>(src->getPixelData());
+  f.dstBase = static_cast<float*>(dst->getPixelData());
+  if (!f.srcBase || !f.dstBase) return false;
+  f.srcStride = std::ptrdiff_t(src->getRowBytes()) / std::ptrdiff_t(sizeof(float));
+  f.dstStride = std::ptrdiff_t(dst->getRowBytes()) / std::ptrdiff_t(sizeof(float));
+  if (f.srcStride == 0 || f.dstStride == 0) return false;
+
+  f.stream = args.pCudaStream;
+  if (!_cuda) _cuda = shp::CudaCreate();
+  if (!_cuda) return false;
+  f.ctx = _cuda;
+  return renderGpu(args, srcB, dstB, f);
 }
 #endif  // SHP_WITH_CUDA
+
+#if SHP_WITH_METAL
+namespace {
+
+/// Describe a host image as a Metal buffer. With Metal enabled getPixelData()
+/// is an id<MTLBuffer>, starting at the bottom row of the bounds -- the OFX
+/// layout, which Resolve's own Metal sample relies on too.
+shp::MetalImage metalImage(OFX::Image* img) {
+  shp::MetalImage m;
+  const OfxRectI b = img->getBounds();
+  m.buffer = img->getPixelData();
+  m.width = b.x2 - b.x1;
+  m.height = b.y2 - b.y1;
+  // Row bytes are honoured when they make sense; a host that leaves them unset
+  // gets the tightly packed layout. MetalRender checks the result against the
+  // buffer's real length before anything is dispatched.
+  const std::ptrdiff_t rb = std::ptrdiff_t(img->getRowBytes()) / std::ptrdiff_t(sizeof(float));
+  m.rowStrideFloats = rb >= std::ptrdiff_t(m.width) * 4 ? rb : std::ptrdiff_t(m.width) * 4;
+  return m;
+}
+
+struct MetalFrame final : GpuFrame {
+  shp::MetalContext* ctx = nullptr;
+  void* queue = nullptr;
+  shp::MetalImage src, dst;
+
+  uint64_t hashSource(float threshold) override {
+    return shp::MetalHashSource(ctx, queue, src, threshold);
+  }
+  bool download(float* hostDst) override {
+    return shp::MetalDownload(ctx, queue, src, hostDst);
+  }
+  bool uploadLabels(const int32_t* labels, const uint8_t* eDist, const uint8_t* eAngle,
+                    int width, int height) override {
+    return shp::MetalUploadLabels(ctx, queue, labels, eDist, eAngle, width, height);
+  }
+  bool composite(const std::vector<shp::ShardDraw>& draws, const shp::TileGrid& tiles,
+                 const shp::CompositeParams& cp) override {
+    return shp::MetalComposite(ctx, queue, src, dst, draws.data(), int(draws.size()),
+                               tiles.start.data(), tiles.tileCount(), tiles.shardIdx.data(),
+                               int(tiles.shardIdx.size()), tiles.tilesX, tiles.tilesY, cp);
+  }
+  bool clear() override { return shp::MetalClear(queue, dst); }
+};
+
+}  // namespace
+
+bool ShatterPhysicsPlugin::renderMetal(const OFX::RenderArguments& args, OFX::Image* src,
+                                       OFX::Image* dst) {
+  MetalFrame f;
+  f.queue = args.pMetalCmdQ;
+  f.src = metalImage(src);
+  f.dst = metalImage(dst);
+  if (!f.queue || !f.src.buffer || !f.dst.buffer) return false;
+
+  if (!_metal) _metal = shp::MetalCreate();
+  if (!_metal) return false;
+  f.ctx = _metal;
+  return renderGpu(args, src->getBounds(), dst->getBounds(), f);
+}
+#endif  // SHP_WITH_METAL
 
 /** @brief Tell the host the picture changes over time, and that it is premultiplied.
  *
@@ -842,6 +986,18 @@ void ShatterPhysicsPlugin::render(const OFX::RenderArguments& args) {
     // Failed: leave the frame black rather than reading device memory on the
     // host. A black frame is a visible bug; a host-side dereference of a device
     // pointer is a crash that takes Resolve with it.
+    return;
+  }
+#endif
+#if SHP_WITH_METAL
+  // Same rule as CUDA, stricter: with Metal enabled the "pixel pointer" is an
+  // id<MTLBuffer>, an Objective-C object, so the CPU loop below would be
+  // writing over the object itself. Nothing from here may fall through --
+  // including the no-source case, which the CPU path handles with a memset.
+  if (args.isEnabledMetalRender) {
+    if (src && renderMetal(args, src.get(), dst.get())) return;
+    if (args.pMetalCmdQ && dst->getPixelData())
+      shp::MetalClear(args.pMetalCmdQ, metalImage(dst.get()));
     return;
   }
 #endif
@@ -1006,6 +1162,13 @@ void ShatterPhysicsFactory::describe(OFX::ImageEffectDescriptor& desc) {
     desc.setSupportsCudaRender(true);
     desc.setSupportsCudaStream(true);
   }
+#endif
+#if SHP_WITH_METAL
+  // The same trade on macOS, where Resolve's pipeline is Metal-resident. Gated
+  // on the kernel having actually compiled, not merely on a device existing:
+  // claiming Metal and then failing to build the pipeline would leave every
+  // frame black, with the CPU loop unable to step in.
+  if (shp::MetalAvailable()) desc.setSupportsMetalRender(true);
 #endif
 
   // Plugin-level property, so it belongs in describe() rather than

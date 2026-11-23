@@ -23,6 +23,9 @@ on the CPU. With it, compositing runs on the GPU and frames stay resident on the
 card, which is what makes realtime playback possible -- see *The GPU path* below.
 CUDA support is declared to the host only when a device is actually present.
 
+On macOS the same job is done by Metal, which needs no toolkit at all -- see
+*The Metal path* below.
+
 ## Build
 
 ```powershell
@@ -400,9 +403,11 @@ glitch. It falls back to the generated pattern.
 
 ## macOS and Linux
 
-The plugin is portable C++17 and builds CPU-only without CUDA. There is no
+The plugin is portable C++17 and builds without CUDA. There is no
 Windows-specific code anywhere under `src` -- no platform headers, no MSVC
 pragmas, no x86 intrinsics -- and every MSVC compiler flag is behind `if(MSVC)`.
+The one macOS-specific piece is the Metal path, which is additive: the CPU path
+underneath it is the same one every platform runs.
 
 ```bash
 git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git external/openfx
@@ -410,8 +415,10 @@ git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git exte
 ./install.sh            # /Library/OFX/Plugins on macOS, /usr/OFX/Plugins elsewhere
 ```
 
-On Apple Silicon this produces an arm64 binary, which is what Resolve is. Pass
-`-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"` for a universal one.
+The Command Line Tools are enough; full Xcode is not needed. On macOS
+`build.sh` produces a universal binary (arm64 + x86_64), because Resolve itself
+is universal and, launched under Rosetta, loads only x86_64 plugins.
+`OSX_ARCHS=arm64 ./build.sh` builds the native slice alone, which is quicker.
 
 Two things are genuinely platform-bound and are handled in CMake rather than by
 hand:
@@ -424,30 +431,67 @@ hand:
 - **macOS needs `Info.plist`**; a bundle without one is not a bundle. It is
   copied on every platform, which is harmless and matches the siblings.
 
+Only the two OFX entry points are exported, as a Windows DLL does by default.
+Without `-fvisibility=hidden` every OFX Support and core symbol is public, and a
+host loading several plugins built on the same Support library sees hundreds of
+identically named C++ symbols from each.
+
 `-ffast-math` is deliberately NOT set to pair with MSVC's `/fp:fast`. The
 determinism the simulation needs is run-to-run on one machine, which plain IEEE
 gives for free, and fast-math is entitled to assume no NaNs -- which would
 quietly delete the guards that keep one bad centroid from poisoning a cached run.
 
-### Why there is no Metal path
+### The Metal path
 
-Nothing requires one: the CPU path is complete, and `CudaAvailable()` is simply
-false, so CUDA support is never declared to the host and the plugin renders on
-the CPU exactly as it does on a Windows machine without a GPU.
+Resolve on macOS is Metal-resident, so a plugin that declines Metal costs every
+frame a trip off the GPU and back -- the same problem *The GPU path* describes
+for CUDA, and solved the same way. Metal support is declared only when a device
+exists **and** the kernel compiled on it; otherwise the plugin stays on the CPU
+exactly as before. The division of labour is CUDA's: segmentation and physics
+on the CPU, the content hash on the GPU (eight bytes come back per frame), the
+label image uploaded once per edit, and the per-pixel compositing on the GPU.
 
-What it costs is the same thing described under *The GPU path*: Resolve on macOS
-is GPU-resident too, so every frame is copied off the card and back. Expect
-comfortable interactive work at 1080p and slower-than-realtime playback at 4K.
-Rendering is unaffected -- only playback.
+Both GPU APIs share one `renderGpu` in `ShatterPlugin.cpp`; `CudaFrame` and
+`MetalFrame` supply only the handful of steps that differ. A fix to how a GPU
+frame is assembled therefore cannot land in one and miss the other.
 
-A Metal port would be meaningfully harder than the CUDA one was, and for a
-specific reason worth knowing before starting. CUDA is C++, so `SHP_HD` let the
-kernel call the *same* `ShadePixel` the CPU path calls and the parity test
-merely confirms what the compiler already guarantees. Metal Shading Language is
-a separate source language: `core/Compositor.h` cannot simply be included, so
-the shading would have to be reimplemented in MSL. That breaks the "the kernel
-contains no maths" rule this codebase leans on, and the parity test stops being
-a formality and becomes the only thing holding the two in agreement.
+**The kernel is a port, not the shared code -- and that matters.** CUDA is
+C++, so `SHP_HD` lets the CUDA kernel call the *same* `ShadePixel` the CPU path
+calls, and its parity test merely confirms what the compiler guarantees. Metal
+Shading Language is a separate language that cannot include `core/Compositor.h`,
+so `src/render/MetalKernel.metal` reimplements `ShadePixel`, `StencilHit`,
+`BevelShade`, `SampleBilinear`, `CompositeOver` and the hash, line for line.
+That breaks the "the kernel contains no maths" rule the CUDA path keeps, and it
+makes `tests/metalparity.cpp` the only thing holding the two in agreement. It
+covers more than the CUDA test for that reason -- bevel, depth shading and a
+Fusion-style offset layout each exercise separately ported code -- and it agrees
+with the CPU bit for bit except in the bevel, where the GPU's cos/sin differ by
+one rounding step (about 1e-7).
+
+The kernel is compiled at load time, not at build time: the offline `metal`
+compiler ships only with full Xcode, so the `.metal` file is embedded in the
+binary as a string (a build step, `cmake/EmbedText.cmake`) and compiled once per
+GPU with fast maths off. `SHP_MAX_BLUR_SAMPLES` is injected from
+`kMaxBlurSamples`, and `static_assert`s in `MetalRender.mm` pin the `ShardDraw`
+layout the kernel mirrors.
+
+With Metal enabled the host's pixel pointer is an `id<MTLBuffer>`, not an
+address, so nothing on this path may fall back to the CPU loop: it would be
+writing over an Objective-C object. Every buffer description is checked against
+the buffer's real length before anything is dispatched, and a mismatch is a
+transparent frame plus a log line rather than a GPU reading past an allocation.
+Diagnostics go to the unified log, because Resolve discards a plugin's stderr:
+
+```bash
+/usr/bin/log show --last 10m --predicate 'subsystem == "com.johnlwi.ShatterPhysics"'
+```
+
+"Metal render path active on ..." appears once per Resolve session when the GPU
+path is really in use, which is otherwise indistinguishable from the CPU path
+by eye.
+
+Like the CUDA path, a Custom Map input falls back to the generated pattern on
+the GPU, since reading it would need its own download.
 
 ## Running inside Fusion
 
@@ -523,6 +567,11 @@ equivalent one depending on click order.
 **Never write a parameter from `render`.** It runs on host worker threads outside
 any edit block, and a host that dispatches the resulting `changedParam` back onto
 one deadlocks against the analysis cache's mutex.
+
+**A change to how a pixel is shaded has to be made twice.** Once in
+`core/Compositor.h` (which the CPU and CUDA paths share) and once in
+`src/render/MetalKernel.metal`. `metalparity` fails until the two agree again,
+so run `ctest` on a Mac after touching either.
 
 **`src/core` includes no OFX header.** That rule is the only thing keeping the
 offline harness and the tests honest -- they link the identical code Resolve runs,

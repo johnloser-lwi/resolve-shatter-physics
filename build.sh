@@ -21,9 +21,14 @@ if [ ! -f "$ROOT/external/openfx/Support/Library/ofxsCore.cpp" ]; then
   exit 1
 fi
 
-# On Apple Silicon this produces an arm64 binary, which is what Resolve is.
-# Set -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" if a universal build is wanted.
-cmake -S "$ROOT" -B "$BUILD" -DCMAKE_BUILD_TYPE="$CONFIG"
+# Resolve ships as a universal binary and can be launched under Rosetta, in
+# which case it only loads x86_64 plugins -- so build both slices by default.
+# Override with OSX_ARCHS=arm64 for a quicker native-only build.
+EXTRA=()
+if [ "$(uname -s)" = "Darwin" ]; then
+  EXTRA+=("-DCMAKE_OSX_ARCHITECTURES=${OSX_ARCHS:-arm64;x86_64}")
+fi
+cmake -S "$ROOT" -B "$BUILD" -DCMAKE_BUILD_TYPE="$CONFIG" ${EXTRA[@]+"${EXTRA[@]}"}
 cmake --build "$BUILD" -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 
 echo
